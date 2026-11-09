@@ -39,6 +39,7 @@ git clone https://github.com/joachimvelde/claude-native
 | `RET` | send; on `… +N lines`, expand |
 | `S-RET`, `C-j` | new line |
 | `TAB` | accept the suggested prompt, or complete `/commands` and `@files` |
+| `↑` / `↓` | previous / next prompt, from the input's first / last line |
 | `M-p` / `M-n` | previous / next prompt |
 | `S-TAB` | cycle permission mode |
 | `C-c C-c` | interrupt |
@@ -69,6 +70,7 @@ added as `@path`. On macOS, HEIC and images over 3.75 MB are converted to JPEG.
 | `claude-native-extra-args` | `nil` |
 | `claude-native-permission-function` | ask in the minibuffer |
 | `claude-native-image-max-bytes` | `3750000` |
+| `claude-native-notify` | `t`: echo-area message when a hidden session finishes |
 
 ## Tests
 

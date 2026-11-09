@@ -53,6 +53,11 @@
                  (const "acceptEdits") (const "plan"))
   :group 'claude-native)
 
+(defcustom claude-native-notify t
+  "Say in the echo area when a turn ends in a session you can't see."
+  :type 'boolean
+  :group 'claude-native)
+
 (defcustom claude-native-permission-function #'claude-native--ask-permission
   "Function deciding a permission request.
 Called with the request alist; returns one of `allow', `always', `deny'."
@@ -77,6 +82,7 @@ Called with the request alist; returns one of `allow', `always', `deny'."
 (defvar-local claude-native--pending nil "Permission requests not yet answered.")
 (defvar-local claude-native--history nil "Prompts sent, newest first.")
 (defvar-local claude-native--history-index -1 "Where M-p/M-n are in the history.")
+(defvar-local claude-native--history-draft "" "The unsent input, kept while going through history.")
 (defvar-local claude-native--spinner nil "Timer animating the status line.")
 (defvar-local claude-native--thinking-tokens 0 "Estimated thinking tokens this turn.")
 (defvar-local claude-native--interrupted nil "Non-nil after C-c C-c, until the turn ends.")
@@ -219,6 +225,8 @@ label as room allows."
   "C-c C-a" #'claude-native-attach
   "M-p" #'claude-native-previous-prompt
   "M-n" #'claude-native-next-prompt
+  "<up>" #'claude-native-up
+  "<down>" #'claude-native-down
   "TAB" #'claude-native-tab
   "<remap> <previous-line>" #'claude-native-previous-line
   "<remap> <evil-previous-line>" #'claude-native-previous-line
@@ -250,8 +258,7 @@ label as room allows."
 \(Line by line, the cursor would land in the strip above the input, which
 it may not enter, and be put back.)"
   (interactive "p")
-  (if (and (>= (point) claude-native--input)
-           (<= (line-beginning-position) claude-native--input))
+  (if (claude-native--in-input-edge-p t)
       (goto-char claude-native--out)
     (if (and (bound-and-true-p evil-mode) (fboundp 'evil-previous-visual-line))
         (evil-previous-visual-line (or n 1))
@@ -378,6 +385,8 @@ so the input does not grow a row, and nothing lands before the ❯."
 (declare-function evil-open-below "evil-commands")
 (with-eval-after-load 'evil
   (evil-define-key* 'normal claude-native-mode-map (kbd "RET") #'claude-native-send)
+  (evil-define-key* '(normal insert) claude-native-mode-map
+    (kbd "<up>") #'claude-native-up (kbd "<down>") #'claude-native-down)
   (evil-set-initial-state 'claude-native-mode 'insert))
 
 (defun claude-native-open-line (count)
@@ -555,7 +564,8 @@ start the turn's spinner."
    (t
     (setq claude-native--queued (claude-native--remove-first text claude-native--queued))
     (claude-native--user text)
-    (setq claude-native--busy nil)
+    ;; A new turn: restart the clock (and the one spinner timer).
+    (claude-native--set-busy nil)
     (claude-native--set-busy t "Working…"))))
 
 (defun claude-native--remove-first (item list)
@@ -588,7 +598,11 @@ start the turn's spinner."
 (a /model or /effort may have changed them)."
   (setq claude-native--drawn nil)
   ;; Prompts still queued: their turns come next, so keep the spinner.
-  (unless claude-native--queued (claude-native--set-busy nil))
+  ;; Slash commands are never echoed back, so the next one starts its
+  ;; turn here instead.
+  (if (and claude-native--queued (string-prefix-p "/" (car claude-native--queued)))
+      (claude-native--user (pop claude-native--queued))
+    (unless claude-native--queued (claude-native--set-busy nil)))
   ;; Requests the turn left unanswered are dead now.
   (dolist (pending claude-native--pending)
     (claude-native--drop-request (alist-get 'request_id pending)))
@@ -601,7 +615,19 @@ start the turn's spinner."
   (let ((ms (alist-get 'duration_ms msg)))
     (when (and ms (> ms 1000) (not (eq (alist-get 'is_error msg) t)))
       (claude-native--note (format "✻ Worked for %ds" (round ms 1000)))))
+  (unless (or claude-native--interrupted claude-native--queued)
+    (claude-native--notify msg))
   (setq claude-native--interrupted nil))
+
+(defun claude-native--notify (msg)
+  "Tell of turn result MSG in the echo area, unless this buffer is in sight."
+  (when (and claude-native-notify (not (get-buffer-window (current-buffer) 'visible)))
+    (let* ((error (eq (alist-get 'is_error msg) t))
+           (text (string-trim (or (alist-get 'result msg) "")))
+           (head (format "%s %s: " (if error "Claude failed in" "Claude finished in") (buffer-name)))
+           (line (car (split-string text "\n" t))))
+      (message "%s%s" (propertize head 'face (if error 'claude-native-tool-error 'claude-native-accent))
+               (truncate-string-to-width (or line "") (max 0 (- (frame-width) (string-width head) 1)) nil nil "…")))))
 
 ;;;; Permission requests
 
@@ -623,7 +649,10 @@ start the turn's spinner."
   "Ask in the minibuffer whether Claude may run REQUEST's tool."
   (let* ((name (alist-get 'tool_name request))
          (summary (claude-native--tool-summary name (alist-get 'input request)))
-         (prompt (format "Allow %s%s? " name (if (string-empty-p summary) "" (format "(%s)" summary))))
+         (prompt (format "%sAllow %s%s? "
+                         ;; From a session out of sight, say which.
+                         (if (get-buffer-window (current-buffer) 'visible) "" (format "[%s] " (buffer-name)))
+                         name (if (string-empty-p summary) "" (format "(%s)" summary))))
          (answer (read-multiple-choice
                   prompt
                   '((?y "yes" "Run it this time")
@@ -824,7 +853,8 @@ conversation drawn first."
     (let ((content (claude-native--prompt-content text)))
       (push text claude-native--history)
       (setq claude-native--suggestion nil
-            claude-native--history-index -1)
+            claude-native--history-index -1
+            claude-native--history-draft "")
       (claude-native--set-input "")
       ;; Idle: draw it now (claude echoes it only once the answer starts).
       ;; Working: draw it on the echo (see `claude-native--prompt-taken'), so
@@ -1037,16 +1067,51 @@ LEVEL is nil for a model without effort levels."
   (interactive "p")
   (let ((index (+ claude-native--history-index n)))
     (when (and (>= index 0) (< index (length claude-native--history)))
+      (when (< claude-native--history-index 0)
+        (setq claude-native--history-draft (claude-native--input-text)))
       (setq claude-native--history-index index)
       (claude-native--set-input (nth index claude-native--history)))))
 
 (defun claude-native-next-prompt (n)
-  "Put the Nth later prompt in the input area."
+  "Put the Nth later prompt in the input area; past the newest, the
+unsent text that was there before."
   (interactive "p")
   (let ((index (- claude-native--history-index n)))
-    (if (< index 0)
-        (progn (setq claude-native--history-index -1) (claude-native--set-input ""))
-      (claude-native-previous-prompt (- n)))))
+    (cond ((< claude-native--history-index 0))
+          ((< index 0)
+           (setq claude-native--history-index -1)
+           (claude-native--set-input claude-native--history-draft))
+          (t (claude-native-previous-prompt (- n))))))
+
+(defun claude-native--in-input-edge-p (up)
+  "Whether point is in the input on its first (UP) or last screen line."
+  (and (>= (point) claude-native--input)
+       (save-excursion
+         ;; The input's field would stop these at its edge.
+         (let ((inhibit-field-text-motion t)
+               (visual (eq (window-buffer) (current-buffer))))
+           (if up
+               (progn (if visual (beginning-of-visual-line) (beginning-of-line))
+                      (<= (point) claude-native--input))
+             (if visual (end-of-visual-line) (end-of-line))
+             (>= (point) (point-max)))))))
+
+(defun claude-native-up (n)
+  "As in Claude Code: on the input's first line, the previous prompt;
+elsewhere, up a line."
+  (interactive "p")
+  (if (claude-native--in-input-edge-p t)
+      (claude-native-previous-prompt n)
+    (claude-native-previous-line n)))
+
+(defun claude-native-down (n)
+  "On the input's last line, the next prompt; elsewhere, down a line."
+  (interactive "p")
+  (if (claude-native--in-input-edge-p nil)
+      (claude-native-next-prompt n)
+    (if (and (bound-and-true-p evil-mode) (fboundp 'evil-next-visual-line))
+        (evil-next-visual-line n)
+      (line-move n t))))
 
 ;;;; Completion: /commands and @files
 

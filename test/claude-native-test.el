@@ -327,3 +327,65 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
         (should (string-suffix-p ".jpg" file))
         (delete-file file))
       (delete-file png) (delete-file heic))))
+
+(ert-deftest claude-native-notifies-when-a-hidden-turn-ends ()
+  (let (said
+        ;; Stubbing a primitive would native-compile a trampoline.
+        (native-comp-enable-subr-trampolines nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (substring-no-properties (apply #'format fmt args)) said))))
+      (with-temp-buffer
+        (rename-buffer "*claude: ~/proj*")
+        (let ((msg '((result . "All done.\nMore detail.") (is_error . :false))))
+          (claude-native--notify msg)
+          (should (equal (car said) "Claude finished in *claude: ~/proj*: All done."))
+          (claude-native--notify '((result . "Boom") (is_error . t)))
+          (should (string-prefix-p "Claude failed in" (car said)))
+          ;; In sight: nothing.
+          (setq said nil)
+          (set-window-buffer (selected-window) (current-buffer))
+          (claude-native--notify msg)
+          (should-not said)
+          (let ((claude-native-notify nil))
+            (set-window-buffer (selected-window) (get-buffer-create "*scratch*"))
+            (claude-native--notify msg)
+            (should-not said)))))))
+
+(ert-deftest claude-native-arrows-go-through-prompts ()
+  (with-temp-buffer
+    (claude-native-mode)
+    (setq claude-native--history (list "two\nlines" "one"))
+    (claude-native--set-input "draft")
+    ;; Up on the input's only line: the newest prompt, the draft kept.
+    (claude-native-up 1)
+    (should (equal (claude-native--input-text) "two\nlines"))
+    ;; Point is at its end: up moves within it first, then to older.
+    (claude-native-up 1)
+    (should (equal (claude-native--input-text) "two\nlines"))
+    (should (<= (point) (+ claude-native--input (length "two"))))
+    (claude-native-up 1)
+    (should (equal (claude-native--input-text) "one"))
+    (claude-native-up 1)
+    (should (equal (claude-native--input-text) "one"))
+    (claude-native-down 1)
+    (should (equal (claude-native--input-text) "two\nlines"))
+    (claude-native-down 1)
+    (should (equal (claude-native--input-text) "draft"))
+    ;; Not in history: down leaves the draft alone.
+    (claude-native-down 1)
+    (should (equal (claude-native--input-text) "draft"))))
+
+(ert-deftest claude-native-spinner-stops-after-a-queued-slash-command ()
+  ;; Claude Code never echoes a slash command back, so its turn has to
+  ;; start at the previous turn's result, or the spinner never stops.
+  (with-temp-buffer
+    (claude-native-mode)
+    (cl-letf (((symbol-function 'claude-native--refresh-settings) #'ignore))
+      (claude-native--set-busy t)
+      (setq claude-native--queued (list "/cost"))
+      (claude-native--result '((is_error . :false)))
+      (should claude-native--busy)
+      (should-not claude-native--queued)
+      (claude-native--result '((is_error . :false)))
+      (should-not claude-native--busy)
+      (should-not claude-native--spinner))))

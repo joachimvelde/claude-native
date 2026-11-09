@@ -1,0 +1,3 @@
+*.elc
+# Real sessions: they hold account details (email, plan, rules).
+dev/recordings/

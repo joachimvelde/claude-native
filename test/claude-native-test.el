@@ -91,8 +91,40 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
     ;; The interrupted turn ends as an error result; only "Interrupted" shows.
     (should-not (string-match-p "error_during_execution" (claude-native-test--transcript)))
     ;; A slash command's output arrives whole, not streamed.
-    (claude-native-test--type-and-send "/cost")
+    (claude-native-test--type-and-send "/compact")
     (claude-native-test--wait (lambda () (string-match-p "subscription" (claude-native-test--transcript))))))
+
+(ert-deftest claude-native-draws-usage ()
+  (claude-native-test--session "dev/recordings/session1.jsonl"
+    (claude-native-test--wait (lambda () claude-native--commands))
+    ;; /usage and its aliases ask claude for numbers and show them in a
+    ;; popup; the transcript stays as it was.
+    (claude-native-test--type-and-send "/cost")
+    (claude-native-test--wait (lambda () (get-buffer "*claude usage*")))
+    (should-not (string-match-p "usage\\|Session" (claude-native-test--transcript)))
+    (let ((text (with-current-buffer "*claude usage*"
+                  (should (derived-mode-p 'claude-native-usage-mode))
+                  (should buffer-read-only)
+                  (buffer-substring-no-properties (point-min) (point-max)))))
+      (kill-buffer "*claude usage*")
+      (should (string-match-p "Current session +█+░  95%  resets Nov 10, " text))
+      (should (string-match-p "Current week (all models) +█+░+  21%  resets Nov 13, " text))
+      (should (string-match-p "Current week (Fable) +█+░+  11%" text))
+      (should (string-match-p "Context +█░+   2%  23k of 1M tokens" text))
+      (should (string-match-p "Session +\\$0\\.42 · 1m 15s API time · \\+12 −3 lines" text))
+      (should (string-match-p "Last 24h · 803 requests · 18 sessions" text))
+      (should (string-match-p " 87%  Start fresh when you switch tasks · run /clear" text))
+      (should (string-match-p "Top skills: /dataviz 2%" text))
+      (should-not (string-match-p "Top subagents" text)))
+    (with-current-buffer buffer
+      (should (equal (claude-native--input-text) "")))))
+
+(ert-deftest claude-native-usage-without-a-plan ()
+  ;; An API key has no plan limits; an old claude gives no context either.
+  (let ((text (claude-native--usage-text
+               '((session . ((total_cost_usd . 1.5))) (rate_limits_available . :false))
+               nil)))
+    (should (equal (substring-no-properties text) "Session  $1.50"))))
 
 (ert-deftest claude-native-transcript-is-read-only ()
   (claude-native-test--session "dev/recordings/session1.jsonl"

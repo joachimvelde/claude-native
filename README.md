@@ -30,6 +30,7 @@ git clone https://github.com/joachimvelde/claude-native
 | `claude-native-continue` | resume the last conversation |
 | `claude-native-new` | start another session for this project |
 | `claude-native-resume` | pick a past session to resume |
+| `claude-native-usage` | show plan limits, context use and session cost |
 | `claude-native-dired-attach` | attach the marked files in dired |
 
 ## Keys
@@ -52,6 +53,8 @@ git clone https://github.com/joachimvelde/claude-native
 | `C-c C-a` in dired | attach the marked files |
 
 `/resume`, `/model`, `/effort`, `/clear` and `/exit` open Emacs prompts.
+`/usage` (also `/cost`, `/stats`) shows plan limits and context use as bars,
+with the session's cost, in a popup below; `q` closes it.
 Other slash commands go to Claude Code as typed.
 
 ## Attaching files

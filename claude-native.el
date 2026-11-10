@@ -27,10 +27,12 @@
 ;;   C-c C-p      answer a permission request you put off
 ;;   C-c /        run a slash command, picked from a list
 ;;
-;; /resume, /model and /exit open native pickers instead of being sent.
+;; /resume, /model and /exit open native pickers instead of being sent;
+;; /usage shows plan limits, context and cost as bars, in a popup.
 ;;
 ;; Files: claude-native-process.el (the pipe), claude-native-render.el
-;; (drawing), claude-native-history.el (past sessions). Tests in test/,
+;; (drawing), claude-native-history.el (past sessions),
+;; claude-native-usage.el (the /usage report). Tests in test/,
 ;; recordings of real sessions in dev/.
 
 ;;; Code:
@@ -39,6 +41,7 @@
 (require 'claude-native-render)
 (require 'claude-native-history)
 (require 'claude-native-attach)
+(require 'claude-native-usage)
 (require 'project)
 
 (defcustom claude-native-model nil
@@ -882,6 +885,9 @@ conversation drawn first."
     ("model" . claude-native-set-model)
     ("effort" . claude-native-set-effort)
     ("clear" . claude-native-clear)
+    ("usage" . claude-native-usage)
+    ("cost" . claude-native-usage)
+    ("stats" . claude-native-usage)
     ("exit" . claude-native-exit)
     ("quit" . claude-native-exit))
   "Slash commands whose terminal dialogs have an Emacs version here.")
@@ -964,6 +970,30 @@ Sessions are listed by name, newest first, with when and how they began."
   (interactive)
   (claude-native--open)
   (goto-char (point-max)))
+
+(defun claude-native-usage ()
+  "Show plan limits, context use and this session's cost, as bars, in a
+window below; q closes it."
+  (interactive)
+  (unless (claude-native-live-p claude-native--conn)
+    (user-error "Claude is not running; M-x claude-native starts it"))
+  (let ((buffer (current-buffer))
+        (conn claude-native--conn))
+    (claude-native-control
+     conn "get_usage" nil
+     (lambda (usage)
+       (claude-native-control
+        conn "get_context_usage" nil
+        (lambda (context)
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (if (equal (alist-get 'subtype usage) "success")
+                  (claude-native--show-usage
+                   (alist-get 'response usage)
+                   (and (equal (alist-get 'subtype context) "success")
+                        (alist-get 'response context)))
+                ;; A claude without get_usage: its own report, as text.
+                (claude-native--send-text "/usage"))))))))))
 
 (defun claude-native-exit ()
   "End this session and close its buffer."

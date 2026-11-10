@@ -31,6 +31,7 @@ git clone https://github.com/joachimvelde/claude-native
 | `claude-native-new` | start another session for this project |
 | `claude-native-resume` | pick a past session to resume |
 | `claude-native-usage` | show plan limits, context use and session cost |
+| `claude-native-agents` | list the sub-agents at work |
 | `claude-native-dired-attach` | attach the marked files in dired |
 
 ## Keys
@@ -49,12 +50,17 @@ git clone https://github.com/joachimvelde/claude-native
 | `C-c C-e` | set effort |
 | `C-c /` | run a slash command from a list |
 | `C-c C-p` | answer a postponed permission request |
+| `C-c C-t` | list the sub-agents at work |
 | `C-c C-k` | end the session |
 | `C-c C-a` in dired | attach the marked files |
 
 `/resume`, `/model`, `/effort`, `/clear` and `/exit` open Emacs prompts.
 `/usage` (also `/cost`, `/stats`) shows plan limits and context use as bars,
 with the session's cost, in a popup below; `q` closes it.
+`/tasks` (or `C-c C-t`) lists the sub-agents at work in a popup below: each
+with its latest step, tool uses, tokens and time so far, updated every second.
+`RET` goes to the agent's call in the session; `q` closes the list. The status
+line shows how many are at work.
 Other slash commands go to Claude Code as typed.
 
 ## Attaching files

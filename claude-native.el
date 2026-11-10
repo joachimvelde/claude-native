@@ -26,13 +26,16 @@
 ;;   TAB          complete /commands and @files
 ;;   C-c C-p      answer a permission request you put off
 ;;   C-c /        run a slash command, picked from a list
+;;   C-c C-t      list the sub-agents at work
 ;;
 ;; /resume, /model and /exit open native pickers instead of being sent;
-;; /usage shows plan limits, context and cost as bars, in a popup.
+;; /usage shows plan limits, context and cost as bars, in a popup;
+;; /tasks lists the sub-agents at work, in a popup.
 ;;
 ;; Files: claude-native-process.el (the pipe), claude-native-render.el
 ;; (drawing), claude-native-history.el (past sessions),
-;; claude-native-usage.el (the /usage report). Tests in test/,
+;; claude-native-usage.el (the /usage report), claude-native-agents.el
+;; (the sub-agents at work). Tests in test/,
 ;; recordings of real sessions in dev/.
 
 ;;; Code:
@@ -42,6 +45,7 @@
 (require 'claude-native-history)
 (require 'claude-native-attach)
 (require 'claude-native-usage)
+(require 'claude-native-agents)
 (require 'project)
 
 (defcustom claude-native-model nil
@@ -226,6 +230,7 @@ label as room allows."
   "C-c C-k" #'claude-native-kill
   "C-c /" #'claude-native-command
   "C-c C-a" #'claude-native-attach
+  "C-c C-t" #'claude-native-agents
   "M-p" #'claude-native-previous-prompt
   "M-n" #'claude-native-next-prompt
   "<up>" #'claude-native-up
@@ -447,6 +452,9 @@ Claude working, a permission request, a mode other than default."
                               (propertize "permission needed: C-c C-p" 'face 'warning))
                             (when claude-native--queued
                               (format "%d queued" (length claude-native--queued)))
+                            (when claude-native--agents
+                              (format "%d agent%s: C-c C-t" (length claude-native--agents)
+                                      (if (cdr claude-native--agents) "s" "")))
                             (when (and mode (not (string-empty-p mode))) mode)
                             (unless (claude-native-live-p claude-native--conn) "ended")))))
     (when parts
@@ -593,7 +601,9 @@ start the turn's spinner."
      (when-let* ((mode (alist-get 'permissionMode msg)))
        (setq claude-native--mode mode)))
     ("thinking_tokens"
-     (setq claude-native--thinking-tokens (or (alist-get 'estimated_tokens msg) 0))))
+     (setq claude-native--thinking-tokens (or (alist-get 'estimated_tokens msg) 0)))
+    ((or "task_started" "task_progress" "task_updated" "task_notification")
+     (claude-native--agent-event msg)))
   (claude-native--refresh-status))
 
 (defun claude-native--result (msg)
@@ -798,6 +808,7 @@ conversation drawn first."
            :on-exit (lambda (event)
                       (when (buffer-live-p buffer)
                         (with-current-buffer buffer
+                          (setq claude-native--agents nil)
                           (claude-native--set-busy nil)
                           (claude-native--note (format "Claude exited (%s). M-x claude-native starts again." event)
                                                'claude-native-tool-error))))))
@@ -810,6 +821,7 @@ conversation drawn first."
 (defconst claude-native--extra-commands
   '(("cost" . "Show usage and what this session cost")
     ("resume" . "Resume a past session of this directory")
+    ("tasks" . "List the sub-agents at work")
     ("exit" . "End this session"))
   "Commands that work but the handshake does not list.")
 
@@ -888,6 +900,7 @@ conversation drawn first."
     ("usage" . claude-native-usage)
     ("cost" . claude-native-usage)
     ("stats" . claude-native-usage)
+    ("tasks" . claude-native-agents)
     ("exit" . claude-native-exit)
     ("quit" . claude-native-exit))
   "Slash commands whose terminal dialogs have an Emacs version here.")

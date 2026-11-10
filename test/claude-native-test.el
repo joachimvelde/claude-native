@@ -126,6 +126,59 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
                nil)))
     (should (equal (substring-no-properties text) "Session  $1.50"))))
 
+;; Task messages as claude 2.1.322 writes them, cut down to what is read.
+(defun claude-native-test--task (subtype id &rest fields)
+  `((type . "system") (subtype . ,subtype) (task_id . ,id) ,@fields))
+
+(ert-deftest claude-native-lists-agents-at-work ()
+  (with-temp-buffer
+    (claude-native-mode)
+    (let ((session (current-buffer))
+          (handle (lambda (msg) (claude-native--handle (current-buffer) msg))))
+      (claude-native--tool-use "toolu_1" "Agent" '((description . "Count files")))
+      (funcall handle (claude-native-test--task
+                       "task_started" "a1" '(tool_use_id . "toolu_1") '(description . "Count files")
+                       '(subagent_type . "general-purpose") '(task_type . "local_agent")))
+      (funcall handle (claude-native-test--task
+                       "task_started" "a2" '(tool_use_id . "toolu_2") '(description . "Slow echo")
+                       '(subagent_type . "Explore") '(task_type . "local_agent")))
+      ;; An agent's own shell is a task too, but not an agent.
+      (funcall handle (claude-native-test--task
+                       "task_started" "b1" '(description . "Print done") '(task_type . "local_bash")
+                       '(parent_task_id . "a1")))
+      (funcall handle (claude-native-test--task
+                       "task_progress" "a1" '(description . "Running Print done")
+                       '(usage . ((total_tokens . 42751) (tool_uses . 2) (duration_ms . 1954)))))
+      (should (equal (mapcar (lambda (agent) (plist-get agent :id)) claude-native--agents) '("a1" "a2")))
+      (should (string-match-p "2 agents: C-c C-t" (claude-native--status-line)))
+      (save-window-excursion
+        (claude-native-agents)
+        (unwind-protect
+            (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+              (should (derived-mode-p 'claude-native-agents-mode))
+              (should buffer-read-only)
+              (should (string-match-p
+                       "⏺ Count files  general-purpose · 2 tool uses · 43k tokens · [0-9]+s\n  ⎿  Running Print done"
+                       text))
+              (should (string-match-p "⏺ Slow echo  Explore · 0 tool uses · [0-9]+s\n  ⎿  Starting…" text))
+              ;; RET on an agent goes to its call in the session.
+              (should (equal (plist-get (get-text-property (point) 'claude-native-agent) :id) "a1"))
+              (claude-native-agents-visit)
+              (should (eq (current-buffer) session))
+              (should (looking-at-p "⏺ Agent(Count files)"))
+              ;; The shell ending leaves its agent; an agent ending goes.
+              (funcall handle (claude-native-test--task "task_notification" "b1" '(status . "completed")))
+              (funcall handle (claude-native-test--task "task_updated" "a1" '(patch . ((status . "completed")))))
+              (funcall handle (claude-native-test--task "task_notification" "a1" '(status . "completed")))
+              (should (equal (mapcar (lambda (agent) (plist-get agent :id)) claude-native--agents) '("a2")))
+              (should (string-match-p "1 agent: C-c C-t" (claude-native--status-line)))
+              (funcall handle (claude-native-test--task "task_notification" "a2" '(status . "failed")))
+              (should-not claude-native--agents)
+              (with-current-buffer "*claude agents*"
+                (claude-native--agents-redraw)
+                (should (string-match-p "No sub-agents are running" (buffer-string)))))
+          (kill-buffer "*claude agents*"))))))
+
 (ert-deftest claude-native-transcript-is-read-only ()
   (claude-native-test--session "dev/recordings/session1.jsonl"
     (claude-native-test--wait (lambda () claude-native--commands))
@@ -185,6 +238,7 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
   (should (eq (claude-native--native-command "/resume") 'claude-native-resume))
   (should (eq (claude-native--native-command "/model ") 'claude-native-set-model))
   (should (eq (claude-native--native-command "/effort") 'claude-native-set-effort))
+  (should (eq (claude-native--native-command "/tasks") 'claude-native-agents))
   (should-not (claude-native--native-command "/effort high"))
   (should-not (claude-native--native-command "/compact"))
   (should-not (claude-native--native-command "please /resume")))

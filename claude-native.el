@@ -17,7 +17,7 @@
 ;; like the terminal UI. It runs claude headless and draws everything here.
 ;;
 ;; In the input area:
-;;   RET          send (S-RET or C-j for a new line)
+;;   RET          send (S-RET or C-j for a new line); on a link, open it
 ;;   C-c C-c      interrupt Claude
 ;;   S-TAB        cycle permission mode (default, accept edits, plan, bypass)
 ;;   C-c C-m      pick a model, then its effort level
@@ -118,13 +118,18 @@ Called with the request alist; returns one of `allow', `always', `deny'."
   "The line above the input. In a window system, a hairline in a row a few
 pixels tall; in a terminal, an underlined row."
   (if (display-graphic-p)
-      ;; A 1px underline; a background would fill the whole (9px) line.
-      (concat (propertize " " 'display '(space :align-to right)
-                          'face '(:height 0.1 :underline (:color foreground-color :position t)
-                                  :inherit claude-native-dim))
-              ;; The line's newline: tiny, and without the frame's line-spacing,
-              ;; so the line is as thin as the hairline.
-              (propertize "\n" 'face '(:height 0.1) 'line-spacing 0))
+      (let ((padding (claude-native--input-padding)))
+        ;; A 1px line; a background would fill the whole (9px) row. It is
+        ;; drawn under the row; with `claude-native-input-padding', over
+        ;; it, and the padding (the row's line-spacing) lies below.
+        (concat (propertize " " 'display '(space :align-to right)
+                            'face `(:height 0.1
+                                    ,@(if (> padding 0)
+                                          '(:overline t)
+                                        '(:underline (:color foreground-color :position t)))
+                                    :inherit claude-native-dim))
+                ;; The row's newline: tiny, so the row is thin.
+                (propertize "\n" 'face '(:height 0.1) 'line-spacing padding)))
     (concat (propertize " " 'display '(space :align-to right)
                         'face '(:inherit claude-native-dim :underline t))
             "\n")))
@@ -803,6 +808,7 @@ conversation drawn first."
            :args (append (list "--allow-dangerously-skip-permissions"
                                "--permission-mode" claude-native-permission-mode)
                          (when claude-native-model (list "--model" claude-native-model))
+                         (claude-native--format-args)
                          (when session-id (list "--resume" session-id)))
            :on-message (lambda (msg) (claude-native--handle buffer msg))
            :on-exit (lambda (event)
@@ -846,11 +852,12 @@ conversation drawn first."
   (claude-native--refresh-status))
 
 (defun claude-native-send ()
-  "Send what is in the input area; on a \"… +N lines\", expand it instead."
+  "Send what is in the input area; on a \"… +N lines\", expand it
+instead; on a link, open it."
   (interactive)
-  (if (get-text-property (point) 'claude-native-more)
-      (claude-native-expand)
-    (claude-native--send-input)))
+  (cond ((get-text-property (point) 'claude-native-more) (claude-native-expand))
+        ((get-text-property (point) 'claude-native-link) (claude-native-open-link))
+        (t (claude-native--send-input))))
 
 (defun claude-native--send-input ()
   "Send what is in the input area."
@@ -937,11 +944,18 @@ conversation drawn first."
           ((< seconds 86400) (format "%dh ago" (round seconds 3600)))
           (t (format "%dd ago" (round seconds 86400))))))
 
+(defun claude-native--session-directory ()
+  "The directory whose sessions are meant here: a session buffer's own,
+elsewhere the project's."
+  (if (derived-mode-p 'claude-native-mode) default-directory (claude-native--project-root)))
+
 (defun claude-native-resume (session-id)
-  "Resume SESSION-ID, a past session of this directory, in this buffer.
+  "Resume SESSION-ID, a past session of this project.
+In a session buffer, it takes that buffer over; from any other buffer, it
+opens in the project's session buffer.
 Sessions are listed by name, newest first, with when and how they began."
   (interactive
-   (let* ((sessions (or (claude-native--sessions default-directory)
+   (let* ((sessions (or (claude-native--sessions (claude-native--session-directory))
                         (user-error "No past sessions here")))
           ;; A session's name, else its first prompt's first line; names may
           ;; repeat, so a number keeps choices apart.
@@ -974,6 +988,12 @@ Sessions are listed by name, newest first, with when and how they began."
                        (complete-with-action action choices string pred)))
                    nil t)))
      (list (plist-get (cdr (assoc choice choices)) :id))))
+  ;; Never the buffer at hand: opening a session erases it, and a read-only
+  ;; one (dired) would stay read-only, input and all.
+  (unless (derived-mode-p 'claude-native-mode)
+    (let ((directory (claude-native--project-root)))
+      (pop-to-buffer-same-window (get-buffer-create (claude-native--buffer-name directory)))
+      (setq default-directory directory)))
   (claude-native--open session-id)
   (goto-char (point-max)))
 

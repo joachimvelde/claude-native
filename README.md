@@ -38,7 +38,7 @@ git clone https://github.com/joachimvelde/claude-native
 
 | Key | |
 |---|---|
-| `RET` | send; on `… +N lines`, expand |
+| `RET` | send; on `… +N lines`, expand; on a link, open it |
 | `S-RET`, `C-j` | new line |
 | `TAB` | accept the suggested prompt, or complete `/commands` and `@files` |
 | `↑` / `↓` | previous / next prompt, from the input's first / last line |
@@ -69,6 +69,23 @@ Images show in the input as `[Image #N]` and PDFs as `[PDF #N]`. They are sent
 with the prompt on `RET`; delete the marker to drop the file. Other files are
 added as `@path`. On macOS, HEIC and images over 3.75 MB are converted to JPEG.
 
+## Org
+
+```elisp
+(setq claude-native-format 'org)
+```
+
+Claude is told to write its replies in Org (`claude-native-org-prompt`, added
+to the system prompt), and its text is drawn with your Org setup: headings,
+aligned tables, highlighted source blocks, links that `RET` or a click opens.
+Copied text is plain Org. Files, commits and tool inputs keep their own
+formats. Replies written in Markdown (older sessions, slash command output)
+are still drawn as Markdown.
+
+Tool calls and their output are dim, so Claude's text stands out; the faces
+are `claude-native-tool-name`, `claude-native-tool-summary` and
+`claude-native-tool-result`.
+
 ## Options
 
 | Option | Default |
@@ -80,6 +97,8 @@ added as `@path`. On macOS, HEIC and images over 3.75 MB are converted to JPEG.
 | `claude-native-permission-function` | ask in the minibuffer |
 | `claude-native-image-max-bytes` | `3750000` |
 | `claude-native-notify` | `t`: echo-area message when a hidden session finishes |
+| `claude-native-format` | `markdown`; `org` has Claude write Org, drawn as in your Org buffers |
+| `claude-native-input-padding` | `0`: empty space above and below the input, in lines |
 
 ## Tests
 

@@ -262,6 +262,120 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
       (should (string-match-p "raw \\*\\*kept\\*\\* `x`" shown))
       (should-not (string-match-p "```" shown)))))
 
+(ert-deftest claude-native-tool-calls-are-quieter-than-text ()
+  (with-temp-buffer
+    (claude-native-mode)
+    (claude-native--text-whole "The answer.")
+    (claude-native--tool-use "t1" "Bash" '((command . "seq 1 10")))
+    (claude-native--tool-result "t1" (mapconcat #'number-to-string (number-sequence 1 10) "\n") nil)
+    (claude-native--tool-use "t2" "Edit" '((file_path . "/x/a") (old_string . "old") (new_string . "new")))
+    (claude-native--tool-result "t2" "updated" nil)
+    (claude-native--tool-use "t3" "Bash" '((command . "false")))
+    (claude-native--tool-result "t3" "boom" t)
+    (cl-flet ((face-of (text)
+                (goto-char (point-min))
+                (search-forward text)
+                (get-text-property (match-beginning 0) 'face)))
+      ;; Claude's text is plain; a tool's arguments and output are dim.
+      (should-not (face-of "The answer."))
+      (should (eq (face-of "(seq 1 10)") 'claude-native-tool-summary))
+      (should (eq (face-of "⎿") 'claude-native-tool-result))
+      (should (eq (face-of "4") 'claude-native-tool-result))
+      ;; Diffs and errors keep their own colours.
+      (should (eq (face-of "+ new") 'claude-native-diff-added))
+      (should (eq (face-of "boom") 'claude-native-tool-error))
+      ;; Lines shown by expanding are dim too.
+      (goto-char (point-min))
+      (search-forward "… +6")
+      (claude-native-send)
+      (should (eq (face-of "10\n") 'claude-native-tool-result)))))
+
+(ert-deftest claude-native-draws-org-as-org ()
+  (let ((claude-native-format 'org))
+    (should (equal (car (claude-native--format-args)) "--append-system-prompt"))
+    (with-temp-buffer
+      (claude-native-mode)
+      (claude-native--text-whole
+       (concat "* Title\nSome *bold* and ~code~, see [[https://example.com][the site]].\n"
+               "| name | n |\n|-\n| a longer cell | 1 |\n"
+               "#+begin_src emacs-lisp\n(message \"hi\")\n#+end_src"))
+      (let ((text (buffer-substring-no-properties (point-min) claude-native--out))
+            (shown (claude-native-test--visible (point-min) claude-native--out)))
+        ;; The text is Org as Claude wrote it, from the first column (the
+        ;; indent is drawn), so a copy of it is Org too; tables are aligned.
+        (should (string-match-p "^⏺ \\* Title$" text))
+        (should (string-match-p "^Some \\*bold\\* and ~code~" text))
+        (should (string-match-p "^| name          | n |$" text))
+        (should (string-match-p "^|---------------\\+---|$" text))
+        ;; Marks and link targets hide.
+        (should (string-match-p "^Some bold and code, see the site\\.$" shown)))
+      (cl-flet ((at (text)
+                  (goto-char (point-min))
+                  (search-forward text)
+                  (goto-char (match-beginning 0))))
+        (at "Title")
+        (should (memq 'org-level-1 (ensure-list (get-text-property (point) 'face))))
+        (at "Some")
+        (should (equal (get-text-property (point) 'line-prefix) claude-native--org-indent))
+        (should (get-text-property (point) 'read-only))
+        ;; Code is highlighted in its language.
+        (at "\"hi\"")
+        (should (memq 'font-lock-string-face (ensure-list (get-text-property (point) 'face))))
+        ;; RET on a link opens it.
+        (at "the site")
+        (let (opened)
+          (cl-letf (((symbol-function 'org-link-open-from-string)
+                     (lambda (link &rest _) (setq opened link))))
+            (claude-native-send))
+          (should (equal opened "[[https://example.com]]")))))
+    ;; Markdown still reads as Markdown: old sessions, slash commands.
+    (with-temp-buffer
+      (claude-native-mode)
+      (claude-native--text-whole "# Title\nSome **bold** and `code`.")
+      (should (equal (claude-native-test--visible (point-min) claude-native--out)
+                     "⏺ Title\nSome bold and code.")))
+    ;; The cursor and the markers around a redrawn block stay put.
+    (with-temp-buffer
+      (claude-native-mode)
+      (claude-native--text-whole "First.")
+      (claude-native--text-start)
+      (claude-native--text-delta "Before\n| a | b |\n| long cell | c |\nAfter")
+      (goto-char (point-min))
+      (search-forward "After")
+      (claude-native--block-stop)
+      (should (looking-back "After" (- (point) 5)))
+      (should (= (char-before claude-native--out) ?r))
+      (should (equal (claude-native--input-text) "")))))
+
+(ert-deftest claude-native-resume-leaves-other-buffers-alone ()
+  (let (opened)
+    (cl-letf (((symbol-function 'claude-native--open)
+               (lambda (id) (setq opened (list id (current-buffer))))))
+      ;; From a session buffer: resumed in that buffer.
+      (with-temp-buffer
+        (claude-native-mode)
+        (claude-native-resume "abc")
+        (should (equal opened (list "abc" (current-buffer)))))
+      ;; From any other buffer (here read-only, like dired): resumed in the
+      ;; project's session buffer; the buffer keeps its text.
+      (let ((origin (generate-new-buffer "a-file"))
+            session)
+        (unwind-protect
+            (save-window-excursion
+              (with-current-buffer origin
+                (insert "a file's text")
+                (setq buffer-read-only t)
+                (claude-native-resume "abc"))
+              (setq session (nth 1 opened))
+              (should-not (eq session origin))
+              (should (equal (buffer-name session)
+                             (with-current-buffer origin
+                               (claude-native--buffer-name (claude-native--project-root)))))
+              (should-not (buffer-local-value 'buffer-read-only session))
+              (should (equal (with-current-buffer origin (buffer-string)) "a file's text")))
+          (kill-buffer origin)
+          (when (buffer-live-p session) (kill-buffer session)))))))
+
 (ert-deftest claude-native-expands-clipped-results ()
   (with-temp-buffer
     (claude-native-mode)

@@ -38,8 +38,14 @@
 (defface claude-native-tool-error '((t :inherit error))
   "The \"⏺\" before a tool call that failed, and error text."
   :group 'claude-native)
-(defface claude-native-tool-name '((t :weight bold))
+(defface claude-native-tool-name '((t :inherit shadow :weight bold))
   "A tool's name."
+  :group 'claude-native)
+(defface claude-native-tool-summary '((t :inherit shadow))
+  "What a tool was called with: the text in parentheses after its name."
+  :group 'claude-native)
+(defface claude-native-tool-result '((t :inherit shadow))
+  "A tool's output, quieter than Claude's text so the two tell apart."
   :group 'claude-native)
 (defface claude-native-dim '((t :inherit shadow))
   "Quiet text: results, hints, the status line."
@@ -60,6 +66,52 @@
   "The welcome line and the input's \"❯\"."
   :group 'claude-native)
 
+;;;; Format
+
+(defcustom claude-native-format 'markdown
+  "What Claude writes its replies in, and how they are drawn.
+`markdown' is Claude Code's own, drawn with the terminal's light look.
+With `org', claude is told to write Org (`claude-native-org-prompt') and
+its text looks as it does in your Org buffers: headings, tables, source
+blocks, links (RET opens one). Sessions started after a change follow it."
+  :type '(choice (const markdown) (const org))
+  :group 'claude-native)
+
+(defcustom claude-native-org-prompt
+  "Your replies are shown in an Emacs Org mode buffer. Write the text of \
+your replies in Org syntax, never Markdown:
+- Headings: lines that start with \"* \" or \"** \", never \"#\".
+- Emphasis: *bold*, /italic/, ~code~, =verbatim=. No backticks, no **double stars**.
+- Code: #+begin_src LANG ... #+end_src (#+begin_example for plain output), never ``` fences.
+- Lists: \"- \" or \"1. \" items. A line that starts with \"* \" is a heading, not an item.
+- Links: [[https://example.com][description]]. Point at a file with \
+[[file:path/to/file.el::42][file.el:42]].
+- Tables: Org tables, \"| a | b |\" rows with a \"|---+---|\" rule under the header.
+Give a reply the structure you would give it in Markdown, no more: most \
+replies need no heading, and a reply does not open with one.
+This holds only for what you say to the user. Files you write, commit \
+messages, pull requests, code comments and tool inputs keep their own formats."
+  "Added to claude's system prompt when `claude-native-format' is `org'."
+  :type 'string
+  :group 'claude-native)
+
+(defun claude-native--format-args ()
+  "The arguments that tell claude which format to write."
+  (when (eq claude-native-format 'org)
+    (list "--append-system-prompt" claude-native-org-prompt)))
+
+(defcustom claude-native-input-padding 0
+  "Empty space above and below the input, in lines: 0.5 is half a line.
+The space above is under the rule. Graphical frames only."
+  :type 'number
+  :group 'claude-native)
+
+(defun claude-native--input-padding ()
+  "`claude-native-input-padding' in pixels; none in a terminal."
+  (if (display-graphic-p)
+      (round (* claude-native-input-padding (default-font-height)))
+    0))
+
 ;;;; Transcript state (buffer-local, set up by `claude-native-mode')
 
 (defvar-local claude-native--out nil
@@ -74,7 +126,8 @@ table (a session has many tool calls; each result looks its call up).")
       (setq claude-native--tools (make-hash-table :test #'equal))))
 
 (defvar-local claude-native--block nil
-  "Plist of the content block being streamed: (:type :start MARKER).")
+  "Plist of the content block being streamed: (:type :start MARKER :org),
+:org non-nil when its text is drawn as Org.")
 (defvar-local claude-native--subagents nil
   "Agent tool_use id -> (REGION . TOOL-COUNT): the line under it showing the
 subagent's latest step.")
@@ -87,6 +140,10 @@ message that follows is not drawn twice.")
 
 (defconst claude-native--indent "  "
   "Indent under a bullet.")
+(defconst claude-native--org-indent
+  (propertize " " 'display '(space :align-to 2) 'face '(:height 0.1))
+  "The indent drawn before a line of Org, as wide as `claude-native--indent'.
+It is short, so a thin line (the rule of a table) stays thin.")
 (defconst claude-native--result-max-lines 4
   "Result lines shown under a tool before \"… +N lines\".")
 
@@ -170,11 +227,14 @@ however tall each line is."
 (defun claude-native--measure-1 (window)
   "Compute `claude-native--measure' for WINDOW, the status hidden."
   (with-selected-window window
-    (let* ((body (window-body-height window t))
-           (row (save-excursion (goto-char (point-max)) (line-pixel-height)))
+    (let* ((row (save-excursion (goto-char (point-max)) (line-pixel-height)))
            ;; Measuring leaves out the last line's line-spacing; drawing
            ;; does not, so keep that much free.
            (spacing (- row (default-font-height)))
+           ;; The padding under the input is space left free at the bottom;
+           ;; the line's spacing is already part of it.
+           (body (- (window-body-height window t)
+                    (max 0 (- (claude-native--input-padding) spacing))))
            (tail (cdr (window-text-pixel-size window (1+ claude-native--spacer) (point-max))))
            ;; Room for the log above the spacer, which is at least a row.
            (room (- body tail spacing row))
@@ -366,20 +426,153 @@ away), but they move your input; its recorded edits move with it."
         ;; A heading may open the block, right after its "⏺ ".
         (each "^\\(?:⏺ \\)? *\\(#+ \\)\\(.*\\)$" 'claude-native-heading)))))
 
+;; Org is loaded on first use, and only for the `org' format.
+(defvar org-inhibit-startup)
+(defvar org-hide-emphasis-markers)
+(defvar org-pretty-entities)
+(defvar org-verbatim-re)
+(declare-function org-table-map-tables "org-table")
+(declare-function org-table-align "org-table")
+(declare-function org-link-make-string "ol")
+(declare-function org-link-open-from-string "ol")
+
+(defun claude-native--markdown-p (text)
+  "Non-nil if TEXT has Markdown's marks and none of Org's: a reply from
+before the format was Org, or a slash command's output."
+  (require 'org)
+  (and (string-match-p "^ *```\\|^#+ \\|\\*\\*[^*\n]+\\*\\*\\|`[^`\n]+`" text)
+       (not (string-match-p (concat "^\\*+ \\|^[ \t]*#\\+\\|\\[\\[\\|" org-verbatim-re) text))))
+
+(defun claude-native--org-buffer ()
+  "The hidden Org buffer Claude's text is fontified in, with your Org setup."
+  (let ((buffer (get-buffer-create " *claude-native-org*")))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'org-mode)
+        ;; No folding, no inline images: the text only passes through.
+        (let ((org-inhibit-startup t)) (org-mode))
+        ;; Marks hide, as Markdown's do; snake_case stays, not a subscript.
+        (setq-local org-hide-emphasis-markers t
+                    org-pretty-entities nil)))
+    buffer))
+
+(defvar-keymap claude-native-link-map
+  :doc "On a link in Claude's text."
+  "<mouse-2>" #'claude-native-open-link-at-mouse
+  "<follow-link>" 'mouse-face)
+
+(defun claude-native--pin-display (spec pinned)
+  "Display SPEC with each variable local to this buffer replaced by its
+value: a spec may size itself by one (org-modern's table rules do), and
+is shown in another buffer. PINNED, a hash table, keeps one result per
+SPEC, since specs that are `eq' draw as one."
+  (cond ((not (consp spec))
+         (if (and spec (symbolp spec) (local-variable-p spec) (numberp (symbol-value spec)))
+             (symbol-value spec)
+           spec))
+        ((gethash spec pinned))
+        (t (puthash spec (cons (claude-native--pin-display (car spec) pinned)
+                               (claude-native--pin-display (cdr spec) pinned))
+                    pinned))))
+
+(defun claude-native--org-render (text)
+  "TEXT as Org shows it: tables aligned; faces, hidden marks and link
+targets as text properties."
+  (with-current-buffer (claude-native--org-buffer)
+    ;; Major modes of source blocks report as they start; not here.
+    (let ((inhibit-message t)
+          (message-log-max nil))
+      (erase-buffer)
+      (insert text)
+      (org-table-map-tables #'org-table-align t)
+      ;; This buffer is never displayed: what its modes work out before
+      ;; each redisplay (org-modern, the font's width) is worked out here.
+      (dolist (function pre-redisplay-functions)
+        (unless (eq function t) (funcall function (selected-window))))
+      ;; Not `font-lock-ensure': it may take a reused buffer for done.
+      (font-lock-fontify-region (point-min) (point-max)))
+    (let ((drawn (buffer-substring-no-properties (point-min) (point-max)))
+          (pinned (make-hash-table :test #'eq))
+          (pos (point-min)))
+      (while (< pos (point-max))
+        (let* ((next (next-property-change pos nil (point-max)))
+               (from (- pos (point-min)))
+               (to (- next (point-min)))
+               (display (get-text-property pos 'display))
+               (link (plist-get (get-text-property pos 'htmlize-link) :uri)))
+          (dolist (prop '(face invisible))
+            (when-let* ((value (get-text-property pos prop)))
+              (put-text-property from to prop value drawn)))
+          (when display
+            (put-text-property from to 'display (claude-native--pin-display display pinned) drawn))
+          (when (stringp link)
+            (add-text-properties from to (list 'claude-native-link link 'help-echo link
+                                               'mouse-face 'highlight
+                                               'keymap claude-native-link-map)
+                                 drawn))
+          (setq pos next)))
+      drawn)))
+
+(defun claude-native--fontify-org (start end)
+  "Give START..END, text Claude wrote in Org, the look Org gives it."
+  (let* ((start (if (markerp start) (marker-position start) start))
+         (text (buffer-substring-no-properties start end))
+         (drawn (claude-native--org-render text))
+         (new-end (+ start (length drawn)))
+         (pos 0))
+    (claude-native--without-undo
+     ;; Aligning a table changed the text: change only what differs, so
+     ;; the cursor and markers stay where they are. (A function is the
+     ;; one form of this argument both Emacs 30 and 31 take.)
+     (unless (string= text drawn)
+       (replace-region-contents start end (lambda () (substring-no-properties drawn))))
+     (while (< pos (length drawn))
+       (let ((next (or (next-property-change pos drawn) (length drawn))))
+         (add-text-properties (+ start pos) (+ start next) (text-properties-at pos drawn))
+         (setq pos next)))
+     (put-text-property start new-end 'line-prefix claude-native--org-indent)
+     (claude-native--protect start new-end))
+    (claude-native--shift-undo start (- (length drawn) (length text)))))
+
+(defun claude-native-open-link ()
+  "Open the link at point in Claude's text."
+  (interactive)
+  (when-let* ((link (get-text-property (point) 'claude-native-link)))
+    (org-link-open-from-string (org-link-make-string link))))
+
+(defun claude-native-open-link-at-mouse (event)
+  "Open the link clicked on (EVENT)."
+  (interactive "e")
+  (posn-set-point (event-end event))
+  (claude-native-open-link))
+
 (defun claude-native--text-start ()
   "Begin a block of Claude's text."
   (claude-native--fresh-line)
   (claude-native--insert (propertize "⏺ " 'face 'claude-native-bullet))
-  (setq claude-native--block (list :type 'text :start (copy-marker claude-native--out))))
+  (setq claude-native--block (list :type 'text :start (copy-marker claude-native--out)
+                                   :org (eq claude-native-format 'org))))
 
 (defun claude-native--text-delta (text)
   "Add streamed TEXT to the current text block."
-  (claude-native--insert (claude-native--indent-lines text)))
+  (claude-native--insert
+   (if (plist-get claude-native--block :org)
+       ;; Org reads columns (a heading's star is in the first), so the
+       ;; indent is drawn, not typed.
+       (propertize text 'line-prefix claude-native--org-indent)
+     (claude-native--indent-lines text))))
 
 (defun claude-native--block-stop ()
-  "Finish the streamed block: give text its markdown look."
+  "Finish the streamed block: give text its Org or markdown look."
   (when (eq (plist-get claude-native--block :type) 'text)
-    (claude-native--fontify-markdown (plist-get claude-native--block :start) claude-native--out))
+    (let ((start (plist-get claude-native--block :start)))
+      (if (and (plist-get claude-native--block :org)
+               (not (claude-native--markdown-p
+                     (buffer-substring-no-properties start claude-native--out))))
+          ;; Your Org setup and the modes of source blocks run in there: a
+          ;; failure leaves the text as written, and the session going.
+          (with-demoted-errors "claude-native: drawing Org failed: %S"
+            (claude-native--fontify-org start claude-native--out))
+        (claude-native--fontify-markdown start claude-native--out))))
   (when-let* ((start (plist-get claude-native--block :start)))
     (set-marker start nil))
   (setq claude-native--block nil))
@@ -448,14 +641,26 @@ away), but they move your input; its recorded edits move with it."
     (claude-native--insert (propertize "⏺" 'face 'claude-native-tool-pending) " "
                            (propertize (if (equal name "TodoWrite") "Update Todos" name) 'face 'claude-native-tool-name)
                            (let ((summary (claude-native--tool-summary name input)))
-                             (if (string-empty-p summary) "" (format "(%s)" summary))))
+                             (if (string-empty-p summary) ""
+                               (propertize (format "(%s)" summary) 'face 'claude-native-tool-summary))))
     (let ((end (copy-marker claude-native--out)))
       (puthash id (list :name name :input input :bullet bullet :end end) (claude-native--tool-table))
       (when (equal name "TodoWrite")
         (claude-native--under end (claude-native--todo-lines (alist-get 'todos input)))))))
 
+(defun claude-native--fill-face (text face)
+  "Give the parts of TEXT that have no face of their own FACE."
+  (let ((pos 0))
+    (while pos
+      (let ((next (next-single-property-change pos 'face text)))
+        (unless (get-text-property pos 'face text)
+          (put-text-property pos (or next (length text)) 'face face text))
+        (setq pos next))))
+  text)
+
 (defun claude-native--under (end lines &optional face keep)
   "Draw LINES (strings) under a tool line that ends at marker END.
+FACE is for the text with no face of its own: the ⎿ and plain lines.
 With KEEP, return the drawn region as a cons of markers, to remove it
 later (markers cost every later insert a little, so only when asked)."
   (when lines
@@ -464,7 +669,7 @@ later (markers cost every later insert a little, so only when asked)."
            ;; Wrapped lines line up under the result, past the ⎿.
            (text (propertize text 'wrap-prefix (concat claude-native--indent "   ")))
            (start (marker-position end)))
-      (claude-native--insert-at end (if face (propertize text 'face face) text))
+      (claude-native--insert-at end (if face (claude-native--fill-face text face) text))
       ;; Later lines under the same tool go after these.
       (set-marker end (+ end (length text)))
       (when keep (cons (copy-marker start) (copy-marker end))))))
@@ -504,9 +709,11 @@ later (markers cost every later insert a little, so only when asked)."
          (mapconcat (lambda (block) (or (alist-get 'text block) "")) content "\n"))
         (t "")))
 
-(defun claude-native--clip (text)
-  "TEXT's first lines, with a count of the rest; RET on the count shows them."
-  (let* ((lines (split-string (string-trim-right text) "\n"))
+(defun claude-native--clip (text &optional face)
+  "TEXT's first lines, with a count of the rest; RET on the count shows them.
+The lines, shown or not, are in FACE (default `claude-native-tool-result')."
+  (let* ((lines (mapcar (lambda (line) (propertize line 'face (or face 'claude-native-tool-result)))
+                        (split-string (string-trim-right text) "\n")))
          (shown (seq-take lines claude-native--result-max-lines))
          (rest (nthcdr claude-native--result-max-lines lines)))
     (if rest
@@ -548,8 +755,7 @@ later (markers cost every later insert a little, so only when asked)."
       (claude-native--under
        (plist-get tool :end)
        (cond
-        (is-error (mapcar (lambda (line) (propertize line 'face 'claude-native-tool-error))
-                          (claude-native--clip text)))
+        (is-error (claude-native--clip text 'claude-native-tool-error))
         ((equal name "Edit")
          (claude-native--diff-lines (alist-get 'old_string input) (alist-get 'new_string input)))
         ((equal name "MultiEdit")
@@ -585,7 +791,8 @@ later (markers cost every later insert a little, so only when asked)."
                                  "Done")
                                'face 'claude-native-dim)))))
         ((string-empty-p (string-trim text)) (list (propertize "(no output)" 'face 'claude-native-dim)))
-        (t (claude-native--clip text)))))))
+        (t (claude-native--clip text)))
+       'claude-native-tool-result))))
 
 (defun claude-native--tool-result (id content is-error)
   "Draw the result of tool call ID, then let go of the call's markers

@@ -32,6 +32,7 @@ git clone https://github.com/joachimvelde/claude-native
 | `claude-native-resume` | pick a past session to resume |
 | `claude-native-usage` | show plan limits, context use and session cost |
 | `claude-native-agents` | list the sub-agents at work |
+| `claude-native-toggle-remote-control` | turn Remote Control on; when on: open or copy its link, or turn it off |
 | `claude-native-dired-attach` | attach the marked files in dired |
 
 ## Keys
@@ -51,6 +52,7 @@ git clone https://github.com/joachimvelde/claude-native
 | `C-c /` | run a slash command from a list |
 | `C-c C-p` | answer a postponed permission request |
 | `C-c C-t` | list the sub-agents at work |
+| `C-c C-r` | Remote Control: turn on; when on, open or copy its link, or turn off |
 | `C-c C-k` | end the session |
 | `C-c C-a` in dired | attach the marked files |
 
@@ -62,6 +64,18 @@ with its latest step, tool uses, tokens and time so far, updated every second.
 `RET` goes to the agent's call in the session; `q` closes the list. The status
 line shows how many are at work.
 Other slash commands go to Claude Code as typed.
+
+## Remote Control
+
+A session can be followed and steered from claude.ai and the Claude app: what
+happens in Emacs shows there, and a prompt sent there runs here and is drawn
+here. Sessions start with it when Claude Code is set to ("Enable Remote Control
+for all sessions" in its `/config`), or always or never with
+`claude-native-remote-control`. `⇄ remote` before the model name says it is
+connected. `C-c C-r` (or `/remote-control`, `/rc`) turns it on; when it is on,
+it offers to open the session's page, copy its link, or turn it off.
+Ending a session (`C-c C-k`, `/exit`, `/clear`, killing the buffer) archives it
+on claude.ai.
 
 ## Attaching files
 
@@ -97,6 +111,7 @@ are `claude-native-tool-name`, `claude-native-tool-summary` and
 | `claude-native-permission-function` | ask in the minibuffer |
 | `claude-native-image-max-bytes` | `3750000` |
 | `claude-native-notify` | `t`: echo-area message when a hidden session finishes |
+| `claude-native-remote-control` | `auto`: start under Remote Control when Claude Code is set to; `t` always, `nil` never |
 | `claude-native-format` | `markdown`; `org` has Claude write Org, drawn as in your Org buffers |
 | `claude-native-input-padding` | `0`: empty space above and below the input, in lines |
 

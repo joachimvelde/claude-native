@@ -144,9 +144,21 @@ ON-MESSAGE gets each message; ON-EXIT the exit description."
                                            (response . ,response))))))
 
 (defun claude-native-stop (conn)
-  "End CONN's process."
+  "End CONN: it is over at once, and ON-EXIT hears \"stopped\".
+The process gets SIGTERM and a few seconds to leave. Killed outright,
+claude cannot sign off, and a session under Remote Control stays listed
+on claude.ai."
   (when (claude-native-live-p conn)
-    (delete-process (claude-native-conn-process conn))))
+    (let ((process (claude-native-conn-process conn))
+          (on-exit (claude-native-conn-on-exit conn)))
+      ;; Detach first: nothing the process says while leaving is passed on.
+      (setf (claude-native-conn-process conn) nil
+            (claude-native-conn-on-message conn) nil
+            (claude-native-conn-on-exit conn) nil)
+      (clrhash (claude-native-conn-callbacks conn))
+      (signal-process process 'SIGTERM)
+      (run-at-time 5 nil (lambda () (when (process-live-p process) (delete-process process))))
+      (when on-exit (funcall on-exit "stopped")))))
 
 (provide 'claude-native-process)
 ;;; claude-native-process.el ends here

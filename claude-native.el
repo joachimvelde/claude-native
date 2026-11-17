@@ -60,6 +60,18 @@
                  (const "acceptEdits") (const "plan"))
   :group 'claude-native)
 
+(defcustom claude-native-remote-control 'auto
+  "Whether a session starts under Remote Control.
+Under it the session is listed on claude.ai and in the Claude app, to
+follow and steer from there. `auto' does what Claude Code is set to do
+\(\"Enable Remote Control for all sessions\" in its /config, which is
+remoteControlAtStartup in settings.json); t is always on, nil never.
+\\[claude-native-toggle-remote-control] switches it for one session."
+  :type '(choice (const :tag "As Claude Code is set up" auto)
+                 (const :tag "On" t)
+                 (const :tag "Off" nil))
+  :group 'claude-native)
+
 (defcustom claude-native-notify t
   "Say in the echo area when a turn ends in a session you can't see."
   :type 'boolean
@@ -82,6 +94,9 @@ Called with the request alist; returns one of `allow', `always', `deny'."
 (defvar-local claude-native--mode claude-native-permission-mode "The permission mode.")
 (defvar-local claude-native--cost 0 "Total cost in USD so far.")
 (defvar-local claude-native--session-id nil "The session's id, for resuming.")
+(defvar-local claude-native--remote nil
+  "Remote Control's state as claude reports it (\"connected\"), nil when off.")
+(defvar-local claude-native--remote-url nil "The session's page on claude.ai.")
 (defvar-local claude-native--commands nil "Slash commands: name -> description.")
 (defvar-local claude-native--command-hints nil
   "Slash commands that take arguments: name -> hint (e.g. \"<file>\").")
@@ -135,8 +150,10 @@ pixels tall; in a terminal, an underlined row."
             "\n")))
 
 (defun claude-native--label ()
-  "The model and effort, as the terminal shows them."
-  (string-join (delq nil (list (and claude-native--model
+  "Remote Control when it is connected, then the model and effort, as
+the terminal shows them."
+  (string-join (delq nil (list (and (equal claude-native--remote "connected") "⇄ remote")
+                               (and claude-native--model
                                     (string-remove-prefix "claude-" claude-native--model))
                                (and claude-native--effort (concat "◐ " claude-native--effort))))
                " · "))
@@ -236,6 +253,7 @@ label as room allows."
   "C-c /" #'claude-native-command
   "C-c C-a" #'claude-native-attach
   "C-c C-t" #'claude-native-agents
+  "C-c C-r" #'claude-native-toggle-remote-control
   "M-p" #'claude-native-previous-prompt
   "M-n" #'claude-native-next-prompt
   "<up>" #'claude-native-up
@@ -607,6 +625,8 @@ start the turn's spinner."
        (setq claude-native--mode mode)))
     ("thinking_tokens"
      (setq claude-native--thinking-tokens (or (alist-get 'estimated_tokens msg) 0)))
+    ("bridge_state"
+     (claude-native--remote-changed (alist-get 'state msg) (alist-get 'detail msg)))
     ((or "task_started" "task_progress" "task_updated" "task_notification")
      (claude-native--agent-event msg)))
   (claude-native--refresh-status))
@@ -815,6 +835,7 @@ conversation drawn first."
                       (when (buffer-live-p buffer)
                         (with-current-buffer buffer
                           (setq claude-native--agents nil)
+                          (claude-native--remote-is nil)
                           (claude-native--set-busy nil)
                           (claude-native--note (format "Claude exited (%s). M-x claude-native starts again." event)
                                                'claude-native-tool-error))))))
@@ -828,6 +849,7 @@ conversation drawn first."
   '(("cost" . "Show usage and what this session cost")
     ("resume" . "Resume a past session of this directory")
     ("tasks" . "List the sub-agents at work")
+    ("remote-control" . "Follow and steer this session from claude.ai or the Claude app")
     ("exit" . "End this session"))
   "Commands that work but the handshake does not list.")
 
@@ -848,6 +870,8 @@ conversation drawn first."
                           (alist-get 'commands info))))
   (when-let* ((mode (alist-get 'current_permission_mode info)))
     (setq claude-native--mode mode))
+  (when (claude-native--remote-wanted-p info)
+    (claude-native--set-remote t))
   (claude-native--refresh-settings)
   (claude-native--refresh-status))
 
@@ -908,6 +932,8 @@ instead; on a link, open it."
     ("cost" . claude-native-usage)
     ("stats" . claude-native-usage)
     ("tasks" . claude-native-agents)
+    ("remote-control" . claude-native-toggle-remote-control)
+    ("rc" . claude-native-toggle-remote-control)
     ("exit" . claude-native-exit)
     ("quit" . claude-native-exit))
   "Slash commands whose terminal dialogs have an Emacs version here.")
@@ -996,6 +1022,74 @@ Sessions are listed by name, newest first, with when and how they began."
       (setq default-directory directory)))
   (claude-native--open session-id)
   (goto-char (point-max)))
+
+;;;; Remote Control
+
+(defun claude-native--remote-wanted-p (info)
+  "Whether the session should start under Remote Control.
+Headless claude leaves that to its host; the handshake INFO says what
+claude's settings ask for, and whether it can work here at all."
+  (and (not (eq (alist-get 'remote_control_available info) :false))
+       (if (eq claude-native-remote-control 'auto)
+           (eq (alist-get 'remote_control_auto_enable info) t)
+         claude-native-remote-control)))
+
+(defun claude-native--remote-is (state &optional url)
+  "Keep Remote Control's STATE (nil: off) and, once known, its page's URL."
+  (setq claude-native--remote state
+        claude-native--remote-url (and state (or url claude-native--remote-url)))
+  (claude-native--update-label))
+
+(defun claude-native--set-remote (on)
+  "Turn Remote Control ON or off."
+  (let ((buffer (current-buffer)))
+    (claude-native-control
+     claude-native--conn "remote_control" `((enabled . ,(if on t :false)))
+     (lambda (response)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (cond
+            ((equal (alist-get 'subtype response) "error")
+             (claude-native--remote-is nil)
+             (message "Remote Control: %s" (alist-get 'error response)))
+            ;; On: \"connected\" follows by itself, as a bridge_state message.
+            (on (claude-native--remote-is (or claude-native--remote "ready")
+                                          (alist-get 'session_url (alist-get 'response response))))
+            (t (claude-native--remote-is nil)))))))))
+
+(defun claude-native--remote-changed (state detail)
+  "Take Remote Control's new STATE from claude; DETAIL says why it ended."
+  (if (member state '("failed" "policy_disabled" "ended"))
+      (progn
+        (claude-native--remote-is nil)
+        (message "Remote Control %s%s" (string-replace "_" " " state)
+                 (if (stringp detail) (concat ": " detail) "")))
+    (claude-native--remote-is state)))
+
+(defun claude-native-toggle-remote-control ()
+  "Turn Remote Control on; when it is on, open or copy its link, or turn it off.
+Under Remote Control the session is listed on claude.ai and in the Claude
+app: what happens here shows there, and prompts sent there run here."
+  (interactive)
+  (unless (claude-native-live-p claude-native--conn)
+    (user-error "Claude is not running; M-x claude-native starts it"))
+  (cond
+   ((not claude-native--remote)
+    (claude-native--set-remote t)
+    (message "Remote Control: connecting…"))
+   ((not claude-native--remote-url)
+    (message "Remote Control: still connecting…"))
+   (t
+    (pcase (car (read-multiple-choice
+                 (format "Remote Control is on · %s" claude-native--remote-url)
+                 '((?o "open" "Open the session on claude.ai")
+                   (?c "copy" "Copy its link")
+                   (?d "disconnect" "Turn Remote Control off")
+                   (?q "quit" "Leave it on"))))
+      (?o (browse-url claude-native--remote-url))
+      (?c (kill-new claude-native--remote-url)
+          (message "Copied %s" claude-native--remote-url))
+      (?d (claude-native--set-remote nil))))))
 
 (defun claude-native-clear ()
   "Start over: a new conversation in this buffer, the old one cleared away.

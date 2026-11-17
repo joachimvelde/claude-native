@@ -551,6 +551,87 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
             (claude-native--notify msg)
             (should-not said)))))))
 
+;; Headless claude leaves Remote Control to its host: the handshake says
+;; what its settings ask for, a control request switches it.
+(ert-deftest claude-native-starts-remote-control-as-claude-is-set-up ()
+  (let (sent said
+        (native-comp-enable-subr-trampolines nil))
+    (cl-letf (((symbol-function 'claude-native-control)
+               (lambda (_conn subtype &optional fields callback)
+                 (push (list subtype fields callback) sent)))
+              ((symbol-function 'claude-native-live-p) (lambda (_conn) t))
+              ((symbol-function 'read-multiple-choice) (lambda (&rest _) '(?d "disconnect")))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) said))))
+      (with-temp-buffer
+        (claude-native-mode)
+        (let ((request (lambda () (seq-find (lambda (it) (equal (car it) "remote_control")) sent)))
+              (handshake (lambda (&rest info) (setq sent nil) (claude-native--initialized info)))
+              (answer (lambda (&rest response) (funcall (nth 2 (car sent)) response)))
+              (state (lambda (&rest fields)
+                       (claude-native--handle (current-buffer)
+                                              `((type . "system") (subtype . "bridge_state") ,@fields)))))
+          ;; Claude's own setting decides.
+          (funcall handshake '(remote_control_auto_enable . t))
+          (should (equal (cadr (funcall request)) '((enabled . t))))
+          (funcall handshake '(remote_control_auto_enable . :false))
+          (should-not (funcall request))
+          ;; Where it can never work, it is left alone.
+          (funcall handshake '(remote_control_auto_enable . t) '(remote_control_available . :false))
+          (should-not (funcall request))
+          ;; The option overrules the setting, both ways.
+          (let ((claude-native-remote-control nil))
+            (funcall handshake '(remote_control_auto_enable . t))
+            (should-not (funcall request)))
+          (let ((claude-native-remote-control t))
+            (funcall handshake)
+            (should (funcall request)))
+          ;; The answer brings the link; the label waits for the connection.
+          (funcall (nth 2 (funcall request))
+                   '((subtype . "success") (response . ((session_url . "https://claude.ai/code/session_x")))))
+          (should (equal claude-native--remote-url "https://claude.ai/code/session_x"))
+          (should-not (string-match-p "remote" (claude-native--label)))
+          (funcall state '(state . "connected"))
+          (should (string-match-p "remote" (claude-native--label)))
+          (should (equal claude-native--remote-url "https://claude.ai/code/session_x"))
+          ;; Lost: the label drops it, the echo area says why.
+          (funcall state '(state . "failed") '(detail . "No network"))
+          (should-not claude-native--remote)
+          (should-not (string-match-p "remote" (claude-native--label)))
+          (should (equal (car said) "Remote Control failed: No network"))
+          ;; The command turns it on; a refusal is said.
+          (claude-native-toggle-remote-control)
+          (should (equal (cadr (car sent)) '((enabled . t))))
+          (funcall answer '(subtype . "error") '(error . "Not signed in"))
+          (should (equal (car said) "Remote Control: Not signed in"))
+          (should-not claude-native--remote)
+          ;; On, the command offers the link, and to turn it off.
+          (claude-native-toggle-remote-control)
+          (funcall answer '(subtype . "success") '(response . ((session_url . "https://claude.ai/code/session_y"))))
+          (should (equal claude-native--remote-url "https://claude.ai/code/session_y"))
+          (claude-native-toggle-remote-control)
+          (should (equal (cadr (car sent)) '((enabled . :false))))
+          (funcall answer '(subtype . "success"))
+          (should-not claude-native--remote)
+          (should-not claude-native--remote-url))))))
+
+;; Killed outright, claude cannot end its Remote Control session.
+(ert-deftest claude-native-stop-lets-claude-sign-off ()
+  (let* ((process (make-process :name "cn-test-sleep" :command '("sleep" "30")
+                                :connection-type 'pipe :noquery t))
+         heard
+         (conn (claude-native-conn--make :process process :on-message #'ignore
+                                         :on-exit (lambda (event) (push event heard)))))
+    (claude-native-stop conn)
+    ;; Over at once for its owner, who hears of it once.
+    (should-not (claude-native-live-p conn))
+    (should (equal heard '("stopped")))
+    (claude-native-stop conn)
+    (should (equal heard '("stopped")))
+    ;; The process itself is asked to leave, not killed.
+    (claude-native-test--wait (lambda () (not (process-live-p process))))
+    (should (equal (list (process-status process) (process-exit-status process)) '(signal 15)))))
+
 (ert-deftest claude-native-arrows-go-through-prompts ()
   (with-temp-buffer
     (claude-native-mode)

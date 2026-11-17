@@ -40,8 +40,8 @@
 (cl-defstruct (claude-native-conn (:constructor claude-native-conn--make))
   "A running claude process."
   process
-  ;; Output not yet ended by a newline.
-  (pending "")
+  ;; Output not yet ended by a newline: chunks, newest first.
+  (pending nil)
   ;; Called with each message (an alist) claude writes.
   on-message
   ;; Called with the exit description when the process ends.
@@ -61,13 +61,22 @@ Arrays become vectors, so a message can be sent back as it came:
 
 (defun claude-native--filter (conn output)
   "Split OUTPUT into lines and hand each message of CONN on."
-  (let* ((text (concat (claude-native-conn-pending conn) output))
-         (lines (split-string text "\n")))
-    ;; The last piece has no newline yet: keep it for the next chunk.
-    (setf (claude-native-conn-pending conn) (car (last lines)))
-    (dolist (line (butlast lines))
-      (when-let* ((msg (and (not (string-empty-p line)) (claude-native--parse line))))
-        (claude-native--dispatch conn msg)))))
+  (if (not (string-search "\n" output))
+      ;; Part of a long line (a big tool result): joined once it ends, so
+      ;; a line of N chunks costs N, not N².
+      (push output (claude-native-conn-pending conn))
+    (let* ((text (apply #'concat (nreverse (cons output (claude-native-conn-pending conn)))))
+           (lines (split-string text "\n")))
+      ;; The last piece has no newline yet: keep it for the next chunk.
+      (setf (claude-native-conn-pending conn) (list (car (last lines))))
+      (dolist (line (butlast lines))
+        (when-let* ((msg (and (not (string-empty-p line)) (claude-native--parse line))))
+          ;; One message that fails to draw must not lose those after it
+          ;; (a lost result would leave the spinner running).
+          (condition-case-unless-debug err
+              (claude-native--dispatch conn msg)
+            (error (message "claude-native: %s on a %s message" (error-message-string err)
+                            (alist-get 'type msg)))))))))
 
 (defun claude-native--dispatch (conn msg)
   "Answer callbacks for control responses; pass every message of CONN on."

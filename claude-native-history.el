@@ -23,15 +23,27 @@
 (require 'claude-native-attach)
 
 (defvar claude-native--history)
+(declare-function claude-native--user-note "claude-native")
 (require 'json)
 (require 'seq)
 (require 'cl-lib)
 
 (defun claude-native--sessions-dir (directory)
-  "Where Claude Code keeps the sessions of DIRECTORY."
-  (let ((name (replace-regexp-in-string
-               "[^a-zA-Z0-9]" "-" (directory-file-name (file-truename directory)))))
-    (expand-file-name name "~/.claude/projects/")))
+  "Where Claude Code keeps the sessions of DIRECTORY.
+As Claude Code names it: every character but a letter or digit becomes
+\"-\" (one per UTF-16 unit, so two for an emoji), and a name over 200
+characters is cut there and given a hash, found here by its prefix."
+  (let* ((name (replace-regexp-in-string
+                "[^a-zA-Z0-9]" (lambda (char) (if (> (string-to-char char) #xFFFF) "--" "-"))
+                (directory-file-name (file-truename directory))))
+         (root (expand-file-name "~/.claude/projects/")))
+    (if (<= (length name) 200)
+        (expand-file-name name root)
+      (let ((prefix (concat (substring name 0 200) "-")))
+        (or (and (file-directory-p root)
+                 (seq-find (lambda (dir) (string-prefix-p prefix (file-name-nondirectory dir)))
+                           (directory-files root t nil t)))
+            (expand-file-name name root))))))
 
 (defun claude-native--read-lines (file)
   "FILE's JSON lines as alists (arrays as vectors), skipping bad lines."
@@ -51,27 +63,52 @@ or a subagent's)."
   (and (equal (alist-get 'type record) "user")
        (not (eq (alist-get 'isMeta record) t))
        (not (eq (alist-get 'isSidechain record) t))
+       ;; "This session is being continued…": written by /compact, not you.
+       (not (eq (alist-get 'isCompactSummary record) t))
        (let ((text (claude-native--prompt-text (alist-get 'content (alist-get 'message record)))))
          (and text
               ;; Slash commands and their output come back wrapped in tags.
               (not (string-prefix-p "<" text))))))
 
+(defconst claude-native--chunk 1000000
+  "Bytes of a session file read at a time when looking for its first prompt.")
+
 (defun claude-native--first-prompt (file)
   "The first prompt in session FILE, or nil if it has none.
-Reads only the start of big files."
-  (with-temp-buffer
-    (insert-file-contents file nil 0 200000)
-    (goto-char (point-min))
-    (catch 'found
-      (while (not (eobp))
-        (let ((record (ignore-errors
-                        (json-parse-string (buffer-substring (point) (line-end-position))
-                                           :object-type 'alist :array-type 'array
-                                           :null-object nil :false-object :false))))
-          (when (and record (claude-native--prompt-p record))
-            (throw 'found (claude-native--prompt-text (alist-get 'content (alist-get 'message record))))))
-        (forward-line 1))
-      nil)))
+Reads the file a piece at a time, up to that prompt: big request records
+may come first, but most of a big file is never read."
+  (let ((size (file-attribute-size (file-attributes file)))
+        (offset 0))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (catch 'found
+        (while (< offset size)
+          ;; Add the next piece after what is left of the last one.
+          (goto-char (point-max))
+          (insert-file-contents-literally file nil offset (min size (+ offset claude-native--chunk)))
+          (setq offset (+ offset claude-native--chunk))
+          (goto-char (point-min))
+          ;; Whole lines only: the last may go on in the next piece.
+          (while (search-forward "\n" nil t)
+            (let ((line-start (line-beginning-position 0)) (line-end (1- (point))))
+              (when (save-excursion (goto-char line-start) (search-forward "\"type\":\"user\"" line-end t))
+                (let ((record (ignore-errors
+                                (json-parse-string (decode-coding-string (buffer-substring line-start line-end) 'utf-8)
+                                                   :object-type 'alist :array-type 'array
+                                                   :null-object nil :false-object :false))))
+                  (when (and record (claude-native--prompt-p record))
+                    (throw 'found (claude-native--prompt-text (alist-get 'content (alist-get 'message record)))))))))
+          ;; Keep only the unfinished last line.
+          (delete-region (point-min) (save-excursion (goto-char (point-max)) (line-beginning-position)))
+          ;; The last line of the file has no newline after it.
+          (when (>= offset size)
+            (let ((record (ignore-errors
+                            (json-parse-string (decode-coding-string (buffer-string) 'utf-8)
+                                               :object-type 'alist :array-type 'array
+                                               :null-object nil :false-object :false))))
+              (when (and record (claude-native--prompt-p record))
+                (throw 'found (claude-native--prompt-text (alist-get 'content (alist-get 'message record))))))))
+        nil))))
 
 (defconst claude-native--title-tail 400000
   "How much of a session file's end is read for its name.")
@@ -129,12 +166,21 @@ Reads the file's end, where the latest title lines are."
                   (let ((text (claude-native--prompt-text (alist-get 'content message))))
                     (claude-native--user text)
                     ;; M-p brings back a resumed session's prompts too.
-                    (push text claude-native--history)))
+                    (push text claude-native--history)
+                    ;; New attachments are numbered past this session's old ones.
+                    (let ((start 0))
+                      (while (string-match claude-native--attach-regexp text start)
+                        (setq start (match-end 0)
+                              claude-native--attach-count (max claude-native--attach-count
+                                                               (string-to-number (match-string 2 text))))))))
                  ((vectorp (alist-get 'content message))
                   (seq-doseq (block (alist-get 'content message))
-                    (when (equal (alist-get 'type block) "tool_result")
-                      (claude-native--tool-result (alist-get 'tool_use_id block) (alist-get 'content block)
-                                                  (eq (alist-get 'is_error block) t)))))))
+                    (pcase (alist-get 'type block)
+                      ("tool_result"
+                       (claude-native--tool-result (alist-get 'tool_use_id block) (alist-get 'content block)
+                                                   (eq (alist-get 'is_error block) t)))
+                      ;; "[Request interrupted by user]", as drawn live.
+                      ("text" (claude-native--user-note (alist-get 'text block))))))))
           ("assistant"
            (seq-doseq (block (alist-get 'content message))
              (pcase (alist-get 'type block)

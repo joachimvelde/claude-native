@@ -45,6 +45,18 @@ The API takes at most 5 MB of base64, which is 3.75 MB of image."
 
 (defvar-local claude-native--attach-count 0 "The last attachment number used.")
 
+(defvar-local claude-native--temp-files nil
+  "JPEG copies made for attaching; deleted with the session buffer.")
+
+;; Kept over /clear, which restarts the mode: the files are still there.
+(put 'claude-native--temp-files 'permanent-local t)
+
+(defun claude-native--delete-temp-files ()
+  "Delete this session's JPEG copies."
+  (dolist (file claude-native--temp-files)
+    (ignore-errors (delete-file file)))
+  (setq claude-native--temp-files nil))
+
 (defun claude-native--shrink-image (file)
   "A JPEG copy of FILE, at most 2000 pixels a side, made with sips."
   (unless (executable-find "sips")
@@ -52,7 +64,9 @@ The API takes at most 5 MB of base64, which is 3.75 MB of image."
   (let ((out (make-temp-file "claude-native-" nil ".jpg")))
     (unless (zerop (call-process "sips" nil nil nil "-s" "format" "jpeg" "-Z" "2000"
                                  (expand-file-name file) "--out" out))
+      (delete-file out)
       (user-error "sips could not convert %s" (file-name-nondirectory file)))
+    (push out claude-native--temp-files)
     out))
 
 (defun claude-native--mention (file)
@@ -71,12 +85,20 @@ quoted when it has spaces."
          (size (file-attribute-size (file-attributes file)))
          (native (assoc ext claude-native--image-types)))
     (cond
+     ;; A directory, whatever its name: Claude reads it from the mention.
+     ((file-directory-p file) (claude-native--mention file))
+     ;; Images and PDFs are read here, when sent: they must be there.
+     ((and (or native (member ext claude-native--convertible) (equal ext "pdf"))
+           (not (file-readable-p file)))
+      (user-error "Can't read %s" (abbreviate-file-name file)))
      ((or (member ext claude-native--convertible)
           (and native (> size claude-native-image-max-bytes)))
       (claude-native--register 'image (claude-native--shrink-image file) "image/jpeg"))
      (native (claude-native--register 'image file (cdr native)))
      ((equal ext "pdf")
-      (when (> size 32000000) (user-error "%s is over the 32 MB PDF limit" (file-name-nondirectory file)))
+      ;; The request may be 32 MB, and base64 makes the file a third bigger.
+      (when (> size 24000000) (user-error "%s is too big: PDFs over 24 MB exceed the API's 32 MB request limit"
+                                          (file-name-nondirectory file)))
       (claude-native--register 'pdf file "application/pdf"))
      (t (claude-native--mention file)))))
 
@@ -105,7 +127,10 @@ name, a vector of their blocks and then the text."
   (let (blocks (start 0))
     (while (string-match claude-native--attach-regexp text start)
       (setq start (match-end 0))
-      (when-let* ((entry (alist-get (string-to-number (match-string 2 text)) claude-native--attachments)))
+      (let ((entry (or (alist-get (string-to-number (match-string 2 text)) claude-native--attachments)
+                       ;; From a resumed session's prompt (M-p): its files are not known here.
+                       (user-error "%s is from before this session started; attach the file again"
+                                   (match-string 0 text)))))
         (pcase-let ((`(,kind ,file ,media) entry))
           (unless (file-readable-p file) (user-error "Attached file is gone: %s" file))
           (push `((type . ,(if (eq kind 'image) "image" "document"))

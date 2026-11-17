@@ -236,8 +236,10 @@ label as room allows."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (let ((applied (alist-get 'applied (alist-get 'response response))))
-             (setq claude-native--model (or (alist-get 'model applied) claude-native--model)
-                   claude-native--effort (or (alist-get 'effort applied) claude-native--effort))
+             (setq claude-native--model (or (alist-get 'model applied) claude-native--model))
+             ;; A model without effort levels reports none: show none.
+             (when (assq 'effort applied)
+               (setq claude-native--effort (alist-get 'effort applied)))
              (claude-native--update-label))))))))
 
 (defvar-keymap claude-native-mode-map
@@ -337,6 +339,7 @@ it may not enter, and be put back.)"
   (add-hook 'pre-command-hook #'claude-native--typing-to-input nil t)
   ;; Killing the buffer ends its claude.
   (add-hook 'kill-buffer-hook (lambda () (claude-native-stop claude-native--conn)) nil t)
+  (add-hook 'kill-buffer-hook #'claude-native--delete-temp-files nil t)
   ;; A resized window lays out again.
   ;; The hook runs with the window as argument, not in its buffer.
   (add-hook 'window-size-change-functions
@@ -368,6 +371,16 @@ it may not enter, and be put back.)"
         ,(if (eq (nth 2 args) 'line) 'exclusive (nth 2 args)) ,@(nthcdr 3 args))
     args))
 
+(defun claude-native--clamp-change (args)
+  "Clamp evil's change ARGS like a delete's; cc keeps the line's newline,
+so the lines below do not join it."
+  (let ((clamped (claude-native--clamp-to-input args)))
+    (if (and (not (eq clamped args)) (eq (nth 2 args) 'line)
+             (> (nth 1 clamped) (nth 0 clamped))
+             (eq (char-before (nth 1 clamped)) ?\n))
+        `(,(nth 0 clamped) ,(1- (nth 1 clamped)) ,@(nthcdr 2 clamped))
+      clamped)))
+
 (defun claude-native--clamp-yank (args)
   "Clamp evil's yank ARGS (BEG END TYPE ...) that start on the ❯, so yy
 in the input copies what you typed, not the prompt."
@@ -379,18 +392,36 @@ in the input copies what you typed, not the prompt."
     args))
 
 (declare-function evil-get-register "evil-common")
+(declare-function evil-visual-state-p "evil-states")
+(declare-function evil-exit-visual-state "evil-states")
 (defvar evil-state)
 (defun claude-native--paste (orig after count &optional register yank-handler)
   "Evil's p (AFTER) and P (ORIG, with COUNT, REGISTER, YANK-HANDLER): in the input,
-paste as plain text where the cursor is. Lines cut with dd keep no newline,
-so the input does not grow a row, and nothing lands before the ❯."
+paste as plain text, nothing landing before the ❯. In visual state, over
+the selection. Whole lines (from dd or yy) go on a line of their own,
+except into an empty input, which would only grow a blank row."
   (if (not (derived-mode-p 'claude-native-mode))
       (funcall orig count register yank-handler)
-    (when-let* ((text (if register (evil-get-register register) (current-kill 0))))
-      (let ((text (string-trim-right (substring-no-properties text) "\n")))
+    (when-let* ((raw (if register (evil-get-register register) (current-kill 0))))
+      (let* ((raw (substring-no-properties raw))
+             (text (string-trim-right raw "\n"))
+             (lines (and (string-suffix-p "\n" raw)
+                         (not (string-empty-p (claude-native--input-text)))
+                         (not (and (fboundp 'evil-visual-state-p) (evil-visual-state-p))))))
+        (when (and (fboundp 'evil-visual-state-p) (evil-visual-state-p))
+          (let ((beg (max (region-beginning) claude-native--input))
+                (end (max (region-end) claude-native--input)))
+            (evil-exit-visual-state)
+            (delete-region beg end)
+            (goto-char beg)
+            (setq after nil)))
         (claude-native--to-input)
         (when (< (point) claude-native--input) (goto-char claude-native--input))
-        (when (and after (< (point) (point-max)) (not (eolp))) (forward-char))
+        (cond
+         ((and lines after) (end-of-line) (insert "\n") (setq text (string-join (make-list (prefix-numeric-value count) text) "\n") count 1))
+         (lines (goto-char (max (line-beginning-position) claude-native--input))
+                (save-excursion (insert "\n")) (setq text (string-join (make-list (prefix-numeric-value count) text) "\n") count 1))
+         ((and after (< (point) (point-max)) (not (eolp))) (forward-char)))
         (dotimes (_ (prefix-numeric-value count)) (insert text))
         (when (and (bound-and-true-p evil-mode) (eq evil-state 'normal)
                    (> (point) claude-native--input))
@@ -403,7 +434,7 @@ so the input does not grow a row, and nothing lands before the ❯."
 
 (with-eval-after-load 'evil
   (advice-add 'evil-delete :filter-args #'claude-native--clamp-to-input)
-  (advice-add 'evil-change :filter-args #'claude-native--clamp-to-input)
+  (advice-add 'evil-change :filter-args #'claude-native--clamp-change)
   (advice-add 'evil-yank :filter-args #'claude-native--clamp-yank)
   (advice-add 'evil-paste-after :around #'claude-native--paste-after)
   (advice-add 'evil-paste-before :around #'claude-native--paste-before))
@@ -424,11 +455,19 @@ so the input does not grow a row, and nothing lands before the ❯."
   "Evil's o and O: in the input, open a line as usual; up in the read-only
 transcript, go to the input's end to type there."
   (interactive "p")
-  (if (< (point) claude-native--input)
-      (progn (goto-char (point-max)) (evil-insert-state))
-    (if (eq this-original-command 'evil-open-above)
-        (evil-open-above count)
-      (evil-open-below count))))
+  (cond
+   ((< (point) claude-native--input)
+    (goto-char (point-max)) (evil-insert-state))
+   ;; Above the input's first line would be before the ❯: open the line
+   ;; at the input's start instead.
+   ((and (eq this-original-command 'evil-open-above)
+         (< (line-beginning-position) claude-native--input))
+    (goto-char claude-native--input)
+    (dotimes (_ count) (insert "\n"))
+    (goto-char claude-native--input)
+    (evil-insert-state))
+   ((eq this-original-command 'evil-open-above) (evil-open-above count))
+   (t (evil-open-below count))))
 
 (defun claude-native--to-input ()
   "Move to the input's end if the cursor is up in the transcript."
@@ -531,6 +570,9 @@ Claude working, a permission request, a mode other than default."
 as the terminal does; its text and streamed output stay out of the log."
   (when (equal (alist-get 'type msg) "assistant")
     (let ((parent (alist-get 'parent_tool_use_id msg)))
+      ;; The model the agent really runs on.
+      (when-let* ((model (alist-get 'model (alist-get 'message msg))))
+        (claude-native--agent-model parent model))
       (seq-doseq (block (alist-get 'content (alist-get 'message msg)))
         (when (equal (alist-get 'type block) "tool_use")
           (let* ((entry (alist-get parent claude-native--subagents nil nil #'equal))
@@ -595,12 +637,30 @@ start the turn's spinner."
     (setq claude-native--quiet (claude-native--remove-first text claude-native--quiet)))
    ((member text claude-native--drawn)
     (setq claude-native--drawn (claude-native--remove-first text claude-native--drawn)))
-   (t
+   ((member text claude-native--queued)
     (setq claude-native--queued (claude-native--remove-first text claude-native--queued))
     (claude-native--user text)
-    ;; A new turn: restart the clock (and the one spinner timer).
-    (claude-native--set-busy nil)
-    (claude-native--set-busy t "Working…"))))
+    (claude-native--new-turn))
+   (t
+    ;; Prompts sent close together come back as one, joined by newlines,
+    ;; when Claude takes them up together: some drawn already, some queued.
+    (let ((rest text) new)
+      (while rest
+        (let ((head (seq-find (lambda (p) (and p (or (equal rest p) (string-prefix-p (concat p "\n") rest))))
+                              (list (car claude-native--quiet) (car claude-native--drawn) (car claude-native--queued)))))
+          (cond
+           ((null head) (push rest new) (setq rest nil))
+           (t (cond ((equal head (car claude-native--quiet)) (pop claude-native--quiet))
+                    ((equal head (car claude-native--drawn)) (pop claude-native--drawn))
+                    (t (pop claude-native--queued) (push head new)))
+              (setq rest (and (not (equal rest head)) (substring rest (1+ (length head)))))))))
+      (when new (claude-native--user (string-join (nreverse new) "\n")))
+      (claude-native--new-turn)))))
+
+(defun claude-native--new-turn ()
+  "A new turn: restart the clock (and the one spinner timer)."
+  (claude-native--set-busy nil)
+  (claude-native--set-busy t "Working…"))
 
 (defun claude-native--remove-first (item list)
   "LIST without its first ITEM (by `equal')."
@@ -625,6 +685,7 @@ start the turn's spinner."
        (setq claude-native--mode mode)))
     ("thinking_tokens"
      (setq claude-native--thinking-tokens (or (alist-get 'estimated_tokens msg) 0)))
+    ("commands_changed" (claude-native--take-commands (alist-get 'commands msg)))
     ("bridge_state"
      (claude-native--remote-changed (alist-get 'state msg) (alist-get 'detail msg)))
     ((or "task_started" "task_progress" "task_updated" "task_notification")
@@ -755,14 +816,20 @@ C-g leaves it waiting. QUIETLY (from the timer): say nothing when none waits."
             ;; "Denied" and "Interrupted" say enough.
             (push tool-id claude-native--denied)
             (setq claude-native--interrupted t)
-            (claude-native--tool-note tool-id "Denied" 'claude-native-tool-error))
-          ;; The next request, asked fresh (not inside this one).
-          (when claude-native--pending
-            (let ((buffer (current-buffer)))
-              (run-at-time 0 nil (lambda () (when (buffer-live-p buffer)
-                                              (with-current-buffer buffer (claude-native-answer-pending t)))))))))))))
+            (claude-native--tool-note tool-id "Denied" 'claude-native-tool-error)))
+        ;; The next request, asked fresh (not inside this one); also when
+        ;; this one was cancelled while asked, so none is left unasked.
+        (when (and decision claude-native--pending)
+          (let ((buffer (current-buffer)))
+            (run-at-time 0 nil (lambda () (when (buffer-live-p buffer)
+                                            (with-current-buffer buffer (claude-native-answer-pending t))))))))))))
 
 ;;;; Commands
+
+(defun claude-native--need-claude ()
+  "Stop the command unless this session's claude runs."
+  (unless (claude-native-live-p claude-native--conn)
+    (user-error "Claude is not running; M-x claude-native starts it again")))
 
 (defun claude-native--project-root ()
   "The directory a session for here should run in."
@@ -781,8 +848,14 @@ With a prefix argument CONTINUE, resume the last conversation here."
          (buffer (get-buffer-create (claude-native--buffer-name directory))))
     (with-current-buffer buffer
       (unless (claude-native-live-p claude-native--conn)
-        (setq default-directory directory)
-        (claude-native--open (and continue (plist-get (car (claude-native--sessions directory)) :id)))))
+        ;; Claude ended here (C-c C-k, a crash): carry on with its
+        ;; conversation, and keep what was typed but not sent.
+        (let ((ended (and (derived-mode-p 'claude-native-mode) claude-native--session-id))
+              (draft (and (derived-mode-p 'claude-native-mode) (claude-native--input-text))))
+          (setq default-directory directory)
+          (claude-native--open (if continue (plist-get (car (claude-native--sessions directory)) :id) ended))
+          (when (and draft (not (string-empty-p draft)))
+            (claude-native--set-input draft)))))
     ;; In this window, like opening a file; no split.
     (pop-to-buffer-same-window buffer)
     (goto-char (point-max))))
@@ -853,21 +926,26 @@ conversation drawn first."
     ("exit" . "End this session"))
   "Commands that work but the handshake does not list.")
 
-(defun claude-native--initialized (info)
-  "Keep what the handshake INFO says: commands, models, mode."
+(defun claude-native--take-commands (commands)
+  "Keep the slash COMMANDS claude offers (from the handshake, or later
+when plugins and MCP servers add theirs)."
   (setq claude-native--commands
         (append (mapcar (lambda (command) (cons (alist-get 'name command) (alist-get 'description command)))
-                        (alist-get 'commands info))
+                        commands)
                 (seq-remove (lambda (extra) (seq-find (lambda (c) (equal (alist-get 'name c) (car extra)))
-                                                      (alist-get 'commands info)))
+                                                      commands))
                             claude-native--extra-commands))
-        claude-native--models (append (alist-get 'models info) nil))
-  (setq claude-native--command-hints
+        claude-native--command-hints
         (delq nil (mapcar (lambda (command)
                             (let ((hint (alist-get 'argumentHint command)))
                               (and (stringp hint) (not (string-empty-p hint))
                                    (cons (alist-get 'name command) hint))))
-                          (alist-get 'commands info))))
+                          commands))))
+
+(defun claude-native--initialized (info)
+  "Keep what the handshake INFO says: commands, models, mode."
+  (claude-native--take-commands (alist-get 'commands info))
+  (setq claude-native--models (append (alist-get 'models info) nil))
   (when-let* ((mode (alist-get 'current_permission_mode info)))
     (setq claude-native--mode mode))
   (when (claude-native--remote-wanted-p info)
@@ -885,8 +963,7 @@ instead; on a link, open it."
 
 (defun claude-native--send-input ()
   "Send what is in the input area."
-  (unless (claude-native-live-p claude-native--conn)
-    (user-error "Claude is not running; M-x claude-native starts it"))
+  (claude-native--need-claude)
   (let ((text (string-trim (claude-native--input-text))))
     (if-let* ((native (claude-native--native-command text)))
         (progn (claude-native--set-input "") (call-interactively native))
@@ -1071,8 +1148,7 @@ claude's settings ask for, and whether it can work here at all."
 Under Remote Control the session is listed on claude.ai and in the Claude
 app: what happens here shows there, and prompts sent there run here."
   (interactive)
-  (unless (claude-native-live-p claude-native--conn)
-    (user-error "Claude is not running; M-x claude-native starts it"))
+  (claude-native--need-claude)
   (cond
    ((not claude-native--remote)
     (claude-native--set-remote t)
@@ -1102,8 +1178,7 @@ app: what happens here shows there, and prompts sent there run here."
   "Show plan limits, context use and this session's cost, as bars, in a
 window below; q closes it."
   (interactive)
-  (unless (claude-native-live-p claude-native--conn)
-    (user-error "Claude is not running; M-x claude-native starts it"))
+  (claude-native--need-claude)
   (let ((buffer (current-buffer))
         (conn claude-native--conn))
     (claude-native-control
@@ -1138,6 +1213,7 @@ window below; q closes it."
 (defun claude-native-cycle-mode ()
   "Switch to the next permission mode."
   (interactive)
+  (claude-native--need-claude)
   (let* ((rest (cdr (member claude-native--mode claude-native--modes)))
          (next (or (car rest) (car claude-native--modes))))
     (claude-native-control claude-native--conn "set_permission_mode" `((mode . ,next)))
@@ -1168,7 +1244,7 @@ window below; q closes it."
 
 (defun claude-native-set-model (model)
   "Use MODEL from now on."
-  (interactive (list (claude-native--read-model)))
+  (interactive (progn (claude-native--need-claude) (list (claude-native--read-model))))
   (let ((buffer (current-buffer)))
     (claude-native-control claude-native--conn "set_model" `((model . ,model))
                            (lambda (_) (when (buffer-live-p buffer)
@@ -1188,7 +1264,7 @@ window below; q closes it."
   "Use MODEL at effort LEVEL: pick the model, then its effort right after.
 LEVEL is nil for a model without effort levels."
   (interactive
-   (let* ((model (claude-native--read-model))
+   (let* ((model (progn (claude-native--need-claude) (claude-native--read-model)))
           (levels (claude-native--effort-levels model)))
      (list model (when levels
                    (completing-read (format "Effort for %s: " model) levels nil t)))))
@@ -1208,8 +1284,9 @@ LEVEL is nil for a model without effort levels."
 (defun claude-native-set-effort (level)
   "Use effort LEVEL from now on (this session)."
   (interactive
-   (list (completing-read (format "Effort (now %s): " (or claude-native--effort "?"))
-                          (claude-native--effort-levels) nil t)))
+   (progn (claude-native--need-claude)
+          (list (completing-read (format "Effort (now %s): " (or claude-native--effort "?"))
+                                 (claude-native--effort-levels) nil t))))
   ;; /effort is how claude takes it; sent quietly, not as a prompt of yours.
   ;; Its one-line confirmation shows, and the label updates after.
   (claude-native--send-quietly (concat "/effort " level)))

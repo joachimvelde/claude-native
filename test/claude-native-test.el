@@ -135,10 +135,15 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
     (claude-native-mode)
     (let ((session (current-buffer))
           (handle (lambda (msg) (claude-native--handle (current-buffer) msg))))
-      (claude-native--tool-use "toolu_1" "Agent" '((description . "Count files")))
+      ;; The session runs haiku at medium; the first call asks for high.
+      (setq claude-native--model "claude-haiku-5-5" claude-native--effort "medium")
+      (claude-native--tool-use "toolu_1" "Agent" '((description . "Count files") (effort . "high")))
       (funcall handle (claude-native-test--task
                        "task_started" "a1" '(tool_use_id . "toolu_1") '(description . "Count files")
                        '(subagent_type . "general-purpose") '(task_type . "local_agent")))
+      ;; Its first message says the model it really runs on.
+      (funcall handle '((type . "assistant") (parent_tool_use_id . "toolu_1")
+                        (message . ((model . "claude-sonnet-5-5") (content . [])))))
       (funcall handle (claude-native-test--task
                        "task_started" "a2" '(tool_use_id . "toolu_2") '(description . "Slow echo")
                        '(subagent_type . "Explore") '(task_type . "local_agent")))
@@ -157,10 +162,15 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
             (let ((text (buffer-substring-no-properties (point-min) (point-max))))
               (should (derived-mode-p 'claude-native-agents-mode))
               (should buffer-read-only)
+              ;; Name and type, what it does now, then model, effort,
+              ;; tool uses, tokens and time.
               (should (string-match-p
-                       "⏺ Count files  general-purpose · 2 tool uses · 43k tokens · [0-9]+s\n  ⎿  Running Print done"
+                       (concat "⏺ Count files  general-purpose\n  ⎿  Running Print done\n"
+                               " +sonnet-5-5 · ◐ high · 2 tool uses · 43k tokens · [0-9]+s")
                        text))
-              (should (string-match-p "⏺ Slow echo  Explore · 0 tool uses · [0-9]+s\n  ⎿  Starting…" text))
+              (should (string-match-p
+                       "⏺ Slow echo  Explore\n  ⎿  Starting…\n +haiku-5-5 · ◐ medium · 0 tool uses · 0 tokens · [0-9]+s"
+                       text))
               ;; RET on an agent goes to its call in the session.
               (should (equal (plist-get (get-text-property (point) 'claude-native-agent) :id) "a1"))
               (claude-native-agents-visit)
@@ -631,6 +641,144 @@ Set CN_SANDBOX to the directory dev/record.py recorded in.")
     ;; The process itself is asked to leave, not killed.
     (claude-native-test--wait (lambda () (not (process-live-p process))))
     (should (equal (list (process-status process) (process-exit-status process)) '(signal 15)))))
+
+;;;; Bugs found 2026-11-17, kept fixed
+
+(ert-deftest claude-native-merged-prompts-leave-the-queue ()
+  ;; Prompts queued while Claude works come back joined when it takes
+  ;; them up together; none may stay "queued" after.
+  (with-temp-buffer
+    (claude-native-mode)
+    (setq claude-native--queued (list "Reply A" "Reply B" "Reply C"))
+    (claude-native--prompt-taken "Reply A\nReply B")
+    (should (equal claude-native--queued '("Reply C")))
+    (claude-native--prompt-taken "Reply C")
+    (should-not claude-native--queued)
+    (should (equal (claude-native-test--transcript) "❯ Reply A\n  Reply B\n\n❯ Reply C\n\n \n❯ "))
+    ;; One drawn when sent (Claude was idle), two queued behind it: each
+    ;; is drawn once.
+    (claude-native--set-busy nil)
+    (setq claude-native--drawn (list "Count") claude-native--queued (list "Q2" "Q3"))
+    (claude-native--prompt-taken "Count\nQ2\nQ3")
+    (should-not (or claude-native--drawn claude-native--queued))
+    (should (string-suffix-p "❯ Reply C\n\n❯ Q2\n  Q3\n\n \n❯ " (claude-native-test--transcript)))
+    (claude-native--set-busy nil)))
+
+(ert-deftest claude-native-filter-survives-a-bad-message ()
+  (let* (got
+         (conn (claude-native-conn--make
+                :on-message (lambda (msg) (when (equal (alist-get 'type msg) "boom") (error "Boom"))
+                              (push (alist-get 'type msg) got))))
+         (debug-on-error nil)
+         (inhibit-message t))
+    (claude-native--filter conn "{\"type\":\"a\"}\n{\"type\":\"boom\"}\n{\"type\":\"result\"}\n{\"type\":\"")
+    (should (equal (reverse got) '("a" "result")))
+    ;; A long line in many pieces arrives whole.
+    (dotimes (_ 50) (claude-native--filter conn "long"))
+    (claude-native--filter conn "\"}\n")
+    (should (equal (car got) (apply #'concat (make-list 50 "long"))))))
+
+(ert-deftest claude-native-asks-the-next-permission-after-a-cancel ()
+  (let (asked timers (native-comp-enable-subr-trampolines nil))
+    (cl-letf (((symbol-function 'run-at-time) (lambda (_ _ f &rest args) (push (cons f args) timers)))
+              ((symbol-function 'claude-native-respond) #'ignore))
+      (with-temp-buffer
+        (claude-native-mode)
+        (let* ((request (lambda (id) `((type . "control_request") (request_id . ,id)
+                                       (request . ((subtype . "can_use_tool") (tool_name . "Bash")
+                                                   (tool_use_id . ,(concat "t" id)) (input . ((command . "ls"))))))))
+               (claude-native-permission-function
+                (lambda (r)
+                  (push (alist-get 'tool_use_id r) asked)
+                  ;; While r1 is asked: r2 arrives, then r1 is cancelled.
+                  (when (equal (alist-get 'tool_use_id r) "tr1")
+                    (claude-native--control-request (funcall request "r2"))
+                    (claude-native--drop-request "r1"))
+                  'allow)))
+          (claude-native--control-request (funcall request "r1"))
+          (while timers (let ((timer (pop timers))) (apply (car timer) (cdr timer))))
+          (should (equal (reverse asked) '("tr1" "tr2")))
+          (should-not claude-native--pending))))))
+
+(ert-deftest claude-native-draws-tricky-markdown ()
+  (cl-flet ((visible (text)
+              (with-temp-buffer
+                (claude-native-mode)
+                (let ((claude-native-format 'markdown))
+                  (claude-native--text-whole text))
+                (let ((s (buffer-substring (point-min) claude-native--input)) (out ""))
+                  (dotimes (i (length s))
+                    (unless (get-text-property i 'invisible s) (setq out (concat out (string (aref s i))))))
+                  (string-trim (substring out 0 (string-search "\n\n \n❯" out)))))))
+    ;; A code block that opens the reply: fences hidden, # kept.
+    (should (equal (visible "```python\nx = 1\n# c\n```") "⏺ x = 1\n  # c"))
+    ;; A longer fence holds a shorter one.
+    (should (string-match-p "```js" (visible "````md\n```js\na\n```\n````")))
+    ;; Stars in code-like text are not italics.
+    (should (equal (visible "f(*args, **kwargs)") "⏺ f(*args, **kwargs)"))
+    (should (equal (visible "Files *.el and *.py") "⏺ Files *.el and *.py"))
+    (should (equal (visible "an *it* and *two*") "⏺ an it and two"))
+    ;; Bold after a marker inside inline code.
+    (should (equal (visible "`x**` foo **bar**") "⏺ x** foo bar"))
+    ;; Org's own marks decide, not [[ or * in code and lists.
+    (should (claude-native--markdown-p "**Bold**\n```bash\n[[ -f x ]]\n```"))
+    (should (claude-native--markdown-p "**Steps**\n* one\n* two"))))
+
+(ert-deftest claude-native-draws-awkward-results ()
+  (with-temp-buffer
+    (claude-native-mode)
+    ;; An empty text block leaves no bullet.
+    (claude-native--text-whole "\n\n")
+    (claude-native--tool-use "t1" "Bash" '((command . "A")))
+    (claude-native--tool-result "t1" (make-string 5000 ?x) nil)
+    (claude-native--tool-use "t2" "Read" '((file_path . "/x.png")))
+    (claude-native--tool-result "t2" [((type . "image"))] nil)
+    (claude-native--tool-use "t3" "Bash" '((command . "B")))
+    (claude-native--tool-result "t3" "a\r\nb\r\n" nil)
+    (claude-native--tool-use "t4" "WebFetch" '((url)))
+    (let ((text (claude-native-test--transcript)))
+      (should (string-prefix-p "⏺ Bash(A)" text))
+      (should (string-match-p "x… (4600 more characters)" text))
+      (should (string-match-p "Read image" text))
+      (should-not (string-match-p "\r" text))
+      (should (string-match-p "⏺ WebFetch\n" text)))))
+
+(ert-deftest claude-native-history-reads-real-shapes ()
+  (let* ((dir (make-temp-file "cn-hist-" t))
+         (file (expand-file-name "s.jsonl" dir))
+         (claude-native--chunk 100))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            ;; A big record before the first prompt, past the first piece.
+            (insert (json-serialize `((type . "api-request-blob") (data . ,(make-string 500 ?z)))) "\n")
+            (insert (json-serialize '((type . "user") (isCompactSummary . t)
+                                      (message . ((role . "user") (content . "This session is being continued")))))
+                    "\n")
+            (insert (json-serialize '((type . "user") (message . ((role . "user") (content . "First prompt"))))) "\n")
+            (insert (json-serialize '((type . "user")
+                                      (message . ((role . "user")
+                                                  (content . [((type . "text") (text . "[Request interrupted by user]"))])))))))
+          (should (equal (claude-native--first-prompt file) "First prompt"))
+          (with-temp-buffer
+            (claude-native-mode)
+            (claude-native--draw-history file)
+            (let ((text (claude-native-test--transcript)))
+              (should-not (string-match-p "being continued" text))
+              (should (string-match-p "Interrupted" text)))))
+      (delete-directory dir t)))
+  ;; An emoji is two UTF-16 units, so two dashes, as Claude Code names it.
+  (should (string-suffix-p "-x--y" (claude-native--sessions-dir "/tmp/x😀y"))))
+
+(ert-deftest claude-native-usage-skips-unknown-limits ()
+  (should (equal (mapcar #'car (claude-native--usage-limits
+                                '((five_hour . ((utilization)))
+                                  (seven_day . ((utilization . 12))))))
+                 '("Current week (all models)")))
+  (should (equal (car (car (claude-native--usage-limits
+                            '((limits . [((kind . "weekly_scoped") (percent . 5)
+                                          (scope . ((surface . "Claude Code"))))])))))
+                 "Current week (Claude Code)")))
 
 (ert-deftest claude-native-arrows-go-through-prompts ()
   (with-temp-buffer

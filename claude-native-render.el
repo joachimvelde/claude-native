@@ -331,20 +331,24 @@ Runs before every redisplay, so no command or scroll can break it."
 Transcript changes are kept out of undo (so undo never takes Claude's text
 away), but they move your input; its recorded edits move with it."
   (when (and (listp buffer-undo-list) (/= delta 0))
-    (setq buffer-undo-list
-          (mapcar
-           (lambda (e)
-             (pcase e
-               ((pred integerp) (if (>= e pos) (+ e delta) e))
-               (`(,(and (pred integerp) beg) . ,(and (pred integerp) end))
-                (if (>= beg pos) (cons (+ beg delta) (+ end delta)) e))
-               (`(,(and (pred stringp) text) . ,(and (pred integerp) at))
-                ;; A negative position means point was at the text's end.
-                (if (>= (abs at) pos) (cons text (if (< at 0) (- at delta) (+ at delta))) e))
-               (`(nil ,prop ,val ,(and (pred integerp) beg) . ,(and (pred integerp) end))
-                (if (>= beg pos) `(nil ,prop ,val ,(+ beg delta) . ,(+ end delta)) e))
-               (_ e)))
-           buffer-undo-list))))
+    ;; In place: `undo' keeps its place in this list (pending-undo-list,
+    ;; undo-equiv-table), and a copy would lose it.
+    (let ((cell buffer-undo-list))
+      (while (consp cell)
+        (let ((e (car cell)))
+          (pcase e
+            ((pred integerp) (when (>= e pos) (setcar cell (+ e delta))))
+            (`(,(and (pred integerp) beg) . ,(and (pred integerp) end))
+             (when (>= beg pos) (setcar e (+ beg delta)) (setcdr e (+ end delta))))
+            (`(,(pred stringp) . ,(and (pred integerp) at))
+             ;; A negative position means point was at the text's end.
+             (when (>= (abs at) pos) (setcdr e (if (< at 0) (- at delta) (+ at delta)))))
+            (`(nil ,_ ,_ ,(and (pred integerp) beg) . ,(and (pred integerp) end))
+             (when (>= beg pos)
+               (let ((tail (nthcdr 3 e)))
+                 (setcar tail (+ beg delta))
+                 (setcdr tail (+ end delta)))))))
+        (setq cell (cdr cell))))))
 
 (defmacro claude-native--without-undo (&rest body)
   "Run BODY, a transcript change, with read-only off and undo not recording."
@@ -388,18 +392,29 @@ away), but they move your input; its recorded edits move with it."
   (claude-native--without-undo
     (save-excursion
       ;; Fenced code blocks first; inline markup does not apply inside them.
+      ;; From the line's start: a block may open right after the "⏺ ".
       (goto-char start)
-      (while (re-search-forward "^ *```.*\n\\(\\(?:.*\n\\)*?\\) *```" end t)
-        (let ((block-start (match-beginning 0))
+      (beginning-of-line)
+      (while (re-search-forward "^\\(?:⏺ \\)? *\\(```+\\).*\n\\(?:.*\n\\)*? *\\1`* *$" end t)
+        (let ((block-start (match-beginning 1))
               (block-end (match-end 0)))
           (add-face-text-property block-start block-end 'claude-native-code)
           (put-text-property block-start block-end 'claude-native-code-block t)
-          ;; The fences go; the code stays, in its colour.
+          ;; The fences go, each with its newline; the code stays, in its colour.
           (save-excursion
             (goto-char block-start)
-            (put-text-property (line-beginning-position) (min block-end (1+ (line-end-position))) 'invisible t)
+            (put-text-property block-start
+                               (min block-end
+                                    (+ (1+ (line-end-position))
+                                       ;; On the "⏺ " line, the code's first line
+                                       ;; takes its place: without the indent.
+                                       (if (and (> block-start (line-beginning-position))
+                                                (string-prefix-p claude-native--indent
+                                                                 (buffer-substring (1+ (line-end-position)) (min end (+ (line-end-position) 1 (length claude-native--indent))))))
+                                           (length claude-native--indent) 0)))
+                               'invisible t)
             (goto-char block-end)
-            (put-text-property (line-beginning-position) block-end 'invisible t))))
+            (put-text-property (line-beginning-position) (min end (1+ block-end)) 'invisible t))))
       ;; Inline markup: style the text, hide the markers (as the terminal
       ;; does). REGEXP's group 1 is the opening marker, 2 the text, 3 the
       ;; closing one.
@@ -408,12 +423,16 @@ away), but they move your input; its recorded edits move with it."
                   (goto-char start)
                   (beginning-of-line)
                   (while (re-search-forward regexp end t)
-                    (unless (or (get-text-property (match-beginning 1) 'claude-native-code-block)
-                                (get-text-property (match-beginning 2) 'claude-native-code-block))
+                    (if (or (get-text-property (match-beginning 1) 'claude-native-code-block)
+                            (get-text-property (match-beginning 2) 'claude-native-code-block))
+                        ;; In code: look again just after this opening
+                        ;; marker, so a real one later on the line is found.
+                        (goto-char (1+ (match-beginning 1)))
                       (add-face-text-property (match-beginning 2) (match-end 2) face)
                       (put-text-property (match-beginning 1) (match-end 1) 'invisible t)
                       (when (match-beginning 3)
-                        (put-text-property (match-beginning 3) (match-end 3) 'invisible t))))))
+                        (put-text-property (match-beginning 3) (match-end 3) 'invisible t)
+                        (goto-char (match-end 3)))))))
         (each "\\(`\\)\\([^`\n]+\\)\\(`\\)" 'claude-native-code)
         ;; Inline code is code: no markup inside it (as for code blocks).
         (goto-char start)
@@ -421,8 +440,10 @@ away), but they move your input; its recorded edits move with it."
         (while (re-search-forward "`[^`\n]+`" end t)
           (put-text-property (match-beginning 0) (match-end 0) 'claude-native-code-block t))
         (each "\\(\\*\\*\\)\\([^*\n]+\\)\\(\\*\\*\\)" 'bold)
-        ;; *it*: the star must not follow a word char (2*3*4 is maths).
-        (each "\\(?:^\\|[^*[:alnum:]_]\\)\\(\\*\\)\\([^*\n ][^*\n]*\\)\\(\\*\\)" 'italic)
+        ;; *it*: the stars hug the text, and neither touches a word char
+        ;; or another star (2*3*4 is maths, f(*a, **kw) is code).
+        (each "\\(?:^\\|[^*[:alnum:]_]\\)\\(\\*\\)\\([^*\n ]\\(?:[^*\n]*[^*\n ]\\)?\\)\\(\\*\\)\\(?:[^*[:alnum:]_]\\|$\\)"
+              'italic)
         ;; A heading may open the block, right after its "⏺ ".
         (each "^\\(?:⏺ \\)? *\\(#+ \\)\\(.*\\)$" 'claude-native-heading)))))
 
@@ -440,8 +461,11 @@ away), but they move your input; its recorded edits move with it."
   "Non-nil if TEXT has Markdown's marks and none of Org's: a reply from
 before the format was Org, or a slash command's output."
   (require 'org)
-  (and (string-match-p "^ *```\\|^#+ \\|\\*\\*[^*\n]+\\*\\*\\|`[^`\n]+`" text)
-       (not (string-match-p (concat "^\\*+ \\|^[ \t]*#\\+\\|\\[\\[\\|" org-verbatim-re) text))))
+  (and (string-match-p "^\\(?:⏺ \\)? *```\\|^#+ \\|\\*\\*[^*\n]+\\*\\*\\|`[^`\n]+`" text)
+       (let ((prose (replace-regexp-in-string
+                     "`[^`\n]+`" ""
+                     (replace-regexp-in-string "^ *```\\(?:.*\n\\)*? *```.*$" "" text))))
+         (not (string-match-p (concat "^[ \t]*#\\+\\|\\[\\[\\|^#\\+begin_\\|" org-verbatim-re) prose)))))
 
 (defun claude-native--org-buffer ()
   "The hidden Org buffer Claude's text is fontified in, with your Org setup."
@@ -565,14 +589,21 @@ targets as text properties."
   "Finish the streamed block: give text its Org or markdown look."
   (when (eq (plist-get claude-native--block :type) 'text)
     (let ((start (plist-get claude-native--block :start)))
-      (if (and (plist-get claude-native--block :org)
+      (cond
+       ((string-blank-p (buffer-substring-no-properties start claude-native--out))
+        ;; Nothing was written: take the bullet away again.
+        (let ((from (save-excursion (goto-char start) (forward-line 0)
+                                    (skip-chars-backward "\n") (point))))
+          (claude-native--shift-undo from (- from claude-native--out))
+          (claude-native--without-undo (delete-region from claude-native--out))))
+       ((and (plist-get claude-native--block :org)
                (not (claude-native--markdown-p
                      (buffer-substring-no-properties start claude-native--out))))
           ;; Your Org setup and the modes of source blocks run in there: a
           ;; failure leaves the text as written, and the session going.
-          (with-demoted-errors "claude-native: drawing Org failed: %S"
-            (claude-native--fontify-org start claude-native--out))
-        (claude-native--fontify-markdown start claude-native--out))))
+        (with-demoted-errors "claude-native: drawing Org failed: %S"
+          (claude-native--fontify-org start claude-native--out)))
+       (t (claude-native--fontify-markdown start claude-native--out)))))
   (when-let* ((start (plist-get claude-native--block :start)))
     (set-marker start nil))
   (setq claude-native--block nil))
@@ -618,11 +649,11 @@ targets as text properties."
     (pcase name
       ("Bash" (claude-native--first-line (funcall get 'command)))
       ((or "Read" "Write" "Edit" "MultiEdit" "NotebookEdit")
-       (claude-native--relative (or (funcall get 'file_path) (funcall get 'notebook_path))))
-      ((or "Grep" "Glob") (format "%s" (funcall get 'pattern)))
-      ("WebFetch" (funcall get 'url))
-      ("WebSearch" (funcall get 'query))
-      ((or "Task" "Agent") (funcall get 'description))
+       (or (claude-native--relative (or (funcall get 'file_path) (funcall get 'notebook_path))) ""))
+      ((or "Grep" "Glob") (claude-native--first-line (format "%s" (or (funcall get 'pattern) ""))))
+      ("WebFetch" (claude-native--first-line (funcall get 'url)))
+      ("WebSearch" (claude-native--first-line (funcall get 'query)))
+      ((or "Task" "Agent") (claude-native--first-line (funcall get 'description)))
       ("TodoWrite" "")
       ;; The (first) question asked.
       ("AskUserQuestion"
@@ -704,16 +735,33 @@ later (markers cost every later insert a little, so only when asked)."
 
 (defun claude-native--result-text (content)
   "Tool result CONTENT (a string or a vector of blocks) as one string."
-  (cond ((stringp content) content)
-        ((vectorp content)
-         (mapconcat (lambda (block) (or (alist-get 'text block) "")) content "\n"))
-        (t "")))
+  (string-replace
+   "\r" ""
+   (cond ((stringp content) content)
+         ((vectorp content)
+          (mapconcat (lambda (block)
+                       (pcase (alist-get 'type block)
+                         ("image" "[Image]")
+                         ("document" "[Document]")
+                         (_ (or (alist-get 'text block) ""))))
+                     (seq-remove (lambda (block) (equal (alist-get 'text block) "")) content)
+                     "\n"))
+         (t ""))))
 
-(defun claude-native--clip (text &optional face)
-  "TEXT's first lines, with a count of the rest; RET on the count shows them.
-The lines, shown or not, are in FACE (default `claude-native-tool-result')."
-  (let* ((lines (mapcar (lambda (line) (propertize line 'face (or face 'claude-native-tool-result)))
-                        (split-string (string-trim-right text) "\n")))
+(defconst claude-native--result-max-width 400
+  "Characters of one result line shown; minified code is one huge line,
+and a line that long makes Emacs slow to draw.")
+
+(defun claude-native--clip-lines (lines)
+  "LINES, at most `claude-native--result-max-lines' of them, each cut to
+`claude-native--result-max-width'; a count of the rest; RET on it shows them."
+  (let* ((lines (mapcar (lambda (line)
+                          (if (> (length line) claude-native--result-max-width)
+                              (concat (substring line 0 claude-native--result-max-width)
+                                      (propertize (format "… (%d more characters)" (- (length line) claude-native--result-max-width))
+                                                  'face 'claude-native-dim))
+                            line))
+                        lines))
          (shown (seq-take lines claude-native--result-max-lines))
          (rest (nthcdr claude-native--result-max-lines lines)))
     (if rest
@@ -721,6 +769,13 @@ The lines, shown or not, are in FACE (default `claude-native-tool-result')."
                                         'face 'claude-native-dim
                                         'claude-native-more rest)))
       shown)))
+
+(defun claude-native--clip (text &optional face)
+  "TEXT's first lines, with a count of the rest; RET on the count shows them.
+The lines, shown or not, are in FACE (default `claude-native-tool-result')."
+  (claude-native--clip-lines
+   (mapcar (lambda (line) (propertize line 'face (or face 'claude-native-tool-result)))
+           (split-string (string-trim-right text) "\n"))))
 
 (defun claude-native-expand ()
   "Show all the lines a \"… +N lines\" stands for, in its place."
@@ -757,15 +812,20 @@ The lines, shown or not, are in FACE (default `claude-native-tool-result')."
        (cond
         (is-error (claude-native--clip text 'claude-native-tool-error))
         ((equal name "Edit")
-         (claude-native--diff-lines (alist-get 'old_string input) (alist-get 'new_string input)))
+         (claude-native--clip-lines
+          (claude-native--diff-lines (or (alist-get 'old_string input) "") (or (alist-get 'new_string input) ""))))
         ((equal name "MultiEdit")
-         (apply #'append (mapcar (lambda (edit)
-                                   (claude-native--diff-lines (alist-get 'old_string edit) (alist-get 'new_string edit)))
-                                 (alist-get 'edits input))))
+         (claude-native--clip-lines
+          (apply #'append (mapcar (lambda (edit)
+                                    (claude-native--diff-lines (or (alist-get 'old_string edit) "")
+                                                               (or (alist-get 'new_string edit) "")))
+                                  (alist-get 'edits input)))))
         ((equal name "Write")
          (let ((lines (split-string (string-remove-suffix "\n" (or (alist-get 'content input) "")) "\n")))
            (list (format "Wrote %d line%s to %s" (length lines) (if (= (length lines) 1) "" "s")
                          (claude-native--relative (alist-get 'file_path input))))))
+        ((and (equal name "Read") (string-match-p "\\`\\[Image\\]" text))
+         (list "Read image"))
         ((equal name "Read")
          ;; Count the file's numbered lines ("   12→text"), not notes added after.
          (let ((n (seq-count (lambda (line) (string-match-p "\\`[ \t]*[0-9]+[→\t]" line))
@@ -775,8 +835,11 @@ The lines, shown or not, are in FACE (default `claude-native-tool-result')."
         ;; "· question → answer", as the terminal shows answers.
         ((equal name "AskUserQuestion")
          (let (pairs (start 0))
-           (while (string-match "\"\\([^\"]+\\)\"=\"\\([^\"]*\\)\"" text start)
-             (push (format "· %s → %s" (match-string 1 text) (match-string 2 text)) pairs)
+           ;; "question"="answer", either with \" inside.
+           (while (string-match "\"\\(\\(?:[^\"\\\\]\\|\\\\.\\)+\\)\"=\"\\(\\(?:[^\"\\\\]\\|\\\\.\\)*\\)\"" text start)
+             (push (format "· %s → %s" (string-replace "\\\"" "\"" (match-string 1 text))
+                           (string-replace "\\\"" "\"" (match-string 2 text)))
+                   pairs)
              (setq start (match-end 0)))
            (or (nreverse pairs) (claude-native--clip text))))
         ;; An agent's result is wrapped for the model; Claude's reply that

@@ -60,7 +60,9 @@ git clone https://github.com/joachimvelde/claude-native
 `/usage` (also `/cost`, `/stats`) shows plan limits and context use as bars,
 with the session's cost, in a popup below; `q` closes it.
 `/tasks` (or `C-c C-t`) lists the sub-agents at work in a popup below: each
-with its latest step, tool uses, tokens and time so far, updated every second.
+with what it does now, then its model, effort, tool uses, tokens and time so
+far, updated every second. The model is the one its messages report; the effort
+is the one its call asked for, else the session's, which agents inherit.
 `RET` goes to the agent's call in the session; `q` closes the list. The status
 line shows how many are at work.
 Other slash commands go to Claude Code as typed.

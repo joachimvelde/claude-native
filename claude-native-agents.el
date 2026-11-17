@@ -19,7 +19,20 @@
 
 (defvar-local claude-native--agents nil
   "Sub-agents at work in this session, oldest first: plists
-\(:id :tool-id :name :type :started :step :tools :tokens).")
+\(:id :tool-id :name :type :model :effort :started :step :tools :tokens).")
+
+(defvar claude-native--model)
+(defvar claude-native--effort)
+
+(defun claude-native--short-model (model)
+  "MODEL without its \"claude-\" prefix."
+  (and (stringp model) (string-remove-prefix "claude-" model)))
+
+(defun claude-native--agent-model (tool-id model)
+  "The agent started by call TOOL-ID answers with MODEL (from its messages)."
+  (when-let* ((agent (seq-find (lambda (agent) (equal (plist-get agent :tool-id) tool-id))
+                               claude-native--agents)))
+    (plist-put agent :model (claude-native--short-model model))))
 
 (defun claude-native--agent-event (msg)
   "Keep `claude-native--agents' in step with MSG, a task message."
@@ -30,14 +43,20 @@
       ("task_started"
        ;; Tasks are also shells and workflows; an agent's own shells too.
        (when (and (not agent) (string-suffix-p "agent" (or (alist-get 'task_type msg) "")))
-         (setq claude-native--agents
-               (append claude-native--agents
-                       (list (list :id id
-                                   :tool-id (alist-get 'tool_use_id msg)
-                                   :name (or (alist-get 'description msg) "Agent")
-                                   :type (alist-get 'subagent_type msg)
-                                   :started (float-time)
-                                   :step nil :tools 0 :tokens 0))))))
+         ;; Model and effort as the call asked for them; else the agent
+         ;; runs as the session does. Its messages say the model for sure.
+         (let ((input (plist-get (gethash (alist-get 'tool_use_id msg) (claude-native--tool-table)) :input)))
+           (setq claude-native--agents
+                 (append claude-native--agents
+                         (list (list :id id
+                                     :tool-id (alist-get 'tool_use_id msg)
+                                     :name (or (alist-get 'description msg) "Agent")
+                                     :type (alist-get 'subagent_type msg)
+                                     :model (claude-native--short-model
+                                             (or (alist-get 'model input) claude-native--model))
+                                     :effort (or (alist-get 'effort input) claude-native--effort)
+                                     :started (float-time)
+                                     :step nil :tools 0 :tokens 0)))))))
       ("task_progress"
        (when agent
          (let ((usage (alist-get 'usage msg)))
@@ -51,31 +70,34 @@
       ("task_notification" (when agent (funcall ended))))))
 
 (defun claude-native--agents-text (agents)
-  "The list of AGENTS: each on two lines, as a tool call in the transcript."
+  "The list of AGENTS, as tool calls in the transcript: name and type, then
+what it does now, then model, effort, tool uses, tokens and time so far."
   (if (null agents)
       (propertize "No sub-agents are running" 'face 'claude-native-dim)
     (mapconcat
      (lambda (agent)
        (let ((tools (plist-get agent :tools))
-             (tokens (plist-get agent :tokens)))
+             (tokens (plist-get agent :tokens))
+             (pad (concat claude-native--indent "   ")))
          (propertize
           (concat
            (propertize "⏺" 'face 'claude-native-tool-pending) " "
            (propertize (plist-get agent :name) 'face 'claude-native-tool-name)
+           (when-let* ((type (plist-get agent :type)))
+             (propertize (format "  %s" type) 'face 'claude-native-dim))
+           "\n" claude-native--indent "⎿  " (or (plist-get agent :step) "Starting…")
+           "\n" pad
            (propertize
-            (concat "  "
-                    (string-join
-                     (delq nil (list (plist-get agent :type)
-                                     (format "%d tool use%s" tools (if (= tools 1) "" "s"))
-                                     (when (> tokens 0)
-                                       (concat (claude-native--usage-tokens tokens) " tokens"))
-                                     (format-seconds "%hh %mm %z%ss"
-                                                     (- (float-time) (plist-get agent :started)))))
-                     " · ")
-                    "\n" claude-native--indent "⎿  " (or (plist-get agent :step) "Starting…"))
+            (string-join
+             (delq nil (list (plist-get agent :model)
+                             (when-let* ((effort (plist-get agent :effort))) (concat "◐ " effort))
+                             (format "%d tool use%s" tools (if (= tools 1) "" "s"))
+                             (format "%s tokens" (claude-native--usage-tokens tokens))
+                             (format-seconds "%hh %mm %z%ss" (- (float-time) (plist-get agent :started)))))
+             " · ")
             'face 'claude-native-dim))
           'claude-native-agent agent)))
-     agents "\n")))
+     agents "\n\n")))
 
 ;;;; The popup
 
@@ -129,16 +151,15 @@ the session; q closes the list."
           (goto-char (point-min))
           (forward-line (1- line))
           (move-to-column column))
-        (fit-window-to-buffer window)))))
+        ;; Fitted when the list grows or shrinks; a size set by hand stays.
+        (unless (eql (window-parameter window 'claude-native-lines) (count-lines (point-min) (point-max)))
+          (set-window-parameter window 'claude-native-lines (count-lines (point-min) (point-max)))
+          (fit-window-to-buffer window))))))
 
 (defun claude-native--agents-tick (buffer)
-  "Redraw popup BUFFER while it shows; stop its timer once it does not."
-  (if (and (buffer-live-p buffer) (get-buffer-window buffer t))
-      (with-current-buffer buffer (claude-native--agents-redraw))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when claude-native--agents-timer (cancel-timer claude-native--agents-timer))
-        (setq claude-native--agents-timer nil)))))
+  "Redraw popup BUFFER when it shows. The timer ends with the buffer."
+  (when (and (buffer-live-p buffer) (get-buffer-window buffer t))
+    (with-current-buffer buffer (claude-native--agents-redraw))))
 
 (defun claude-native--show-agents (session)
   "Show the sub-agents at work in SESSION, a session buffer, in a window below."
@@ -152,7 +173,6 @@ the session; q closes the list."
       (forward-line 1))
     (pop-to-buffer buffer '((display-buffer-reuse-window display-buffer-at-bottom)
                             (window-height . fit-window-to-buffer)))
-    ;; Started once the popup shows: the timer ends itself when it does not.
     (with-current-buffer buffer
       (unless claude-native--agents-timer
         (setq claude-native--agents-timer

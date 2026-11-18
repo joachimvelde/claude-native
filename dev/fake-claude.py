@@ -3,7 +3,7 @@
 from dev/record.py. Lines claude wrote are written back; where the recording
 has a line the client sent, this waits for the client to send one. Request
 ids in responses are swapped for the ones the client really used.
-The recording is named by $CLAUDE_NATIVE_REPLAY; arguments are ignored."""
+The recording is named by $AGENT_NATIVE_REPLAY; arguments are ignored."""
 import json, os, sys, time
 
 ids = {}  # recorded request_id -> the client's
@@ -29,6 +29,8 @@ ANSWERS = {
                                  "title": "Start fresh when you switch tasks", "detail": "run /clear"}],
             "skills": [{"name": "dataviz", "pct": 2}], "agents": [], "plugins": [], "mcp_servers": []}}},
     "get_context_usage": {"totalTokens": 23404, "maxTokens": 1000000, "percentage": 2},
+    # Sent at start when Claude Code is set to start Remote Control.
+    "remote_control": {"session_url": "https://claude.ai/code/session_replay"},
 }
 
 def answer(sent):
@@ -41,7 +43,7 @@ def answer(sent):
     sys.stdout.flush()
     return True
 
-for line in open(os.environ["CLAUDE_NATIVE_REPLAY"]):
+for line in open(os.environ["AGENT_NATIVE_REPLAY"]):
     record = json.loads(line)
     msg = record["msg"]
     if record["dir"] == "in":
